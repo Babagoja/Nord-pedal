@@ -1,0 +1,150 @@
+================================================================
+NORD6 LATCHING SWITCH — SETUP INSTRUCTIONS
+================================================================
+
+Goal: turn the latching switch on BCM 12 into a clean stop/start
+control for nord6.service. When the switch is off, Nord6 is not
+running at all. When the switch is on, Nord6 is running. Flipping
+the switch acts as a full reset (good for recovery from MIDI
+connection issues, Nord USB drop, etc.).
+
+How it works:
+  - A small service (nord6-switch.service) watches BCM 12.
+  - On switch ON  -> systemctl start nord6.service
+  - On switch OFF -> systemctl stop  nord6.service
+  - nord6.service is NO LONGER autostarted on boot; the watcher
+    decides based on switch position.
+
+PREREQUISITE: overlay filesystem must be DISABLED before applying
+these changes (otherwise they wipe on reboot). Check with:
+  mount | grep overlay   (should return nothing)
+
+If overlay is on:
+  sudo raspi-config -> Performance Options -> Overlay File System
+  -> disable -> reboot -> come back to this file.
+
+================================================================
+STEP 1 — COPY FILES TO THE PI
+================================================================
+USB-transfer these two files to the Pi:
+  - Nord6.py                (updated source, replaces the old one)
+  - nord6_switch_watcher.py
+
+Then on the Pi:
+  cp /media/chickhicks38/USBNAME/Nord6.py \
+     /home/chickhicks38/Desktop/Nord6.py
+  cp /media/chickhicks38/USBNAME/nord6_switch_watcher.py \
+     /home/chickhicks38/Desktop/nord6_switch_watcher.py
+
+(USBNAME = whatever your stick mounts as — check ls /media/chickhicks38/)
+
+Verify the new Nord6.py:
+  wc -l /home/chickhicks38/Desktop/Nord6.py
+  # should be ~1430 lines, similar to before. If it's much smaller,
+  # the copy didn't replace.
+
+================================================================
+STEP 2 — CREATE THE WATCHER SYSTEMD SERVICE
+================================================================
+
+  sudo nano /etc/systemd/system/nord6-switch.service
+
+Paste in:
+
+----------------------------------------------------------------
+[Unit]
+Description=Nord6 latching-switch watcher
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/chickhicks38/Desktop/nord6_switch_watcher.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+----------------------------------------------------------------
+
+Save (Ctrl+O, Enter, Ctrl+X).
+
+================================================================
+STEP 3 — SWITCH THE AUTOSTART OVER
+================================================================
+Disable nord6.service's autostart (the watcher controls it now):
+
+  sudo systemctl disable nord6.service
+
+Enable the watcher to autostart instead:
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable nord6-switch.service
+
+================================================================
+STEP 4 — TEST WITHOUT REBOOTING
+================================================================
+Start the watcher manually:
+
+  sudo systemctl start nord6-switch.service
+
+Watch its logs:
+
+  sudo journalctl -u nord6-switch.service -f
+
+Now flip the switch. You should see "[switch] flipped ON ->
+starting nord6.service" and "[switch] flipped OFF -> stopping
+nord6.service" alternating with each flip. When ON, the Nord's
+MIDI light should glow within a few seconds.
+
+In a second terminal (or by pressing Ctrl+C on the log viewer
+first), you can also watch Nord6 itself:
+  sudo journalctl -u nord6.service -f
+
+================================================================
+STEP 5 — REBOOT TO CONFIRM
+================================================================
+
+  sudo reboot
+
+After reboot:
+  - If switch is in OFF position: Nord6 does NOT start. The
+    watcher sees the switch is off and leaves Nord6 stopped.
+  - If switch is in ON position: watcher starts nord6.service
+    automatically after boot.
+
+Verify:
+  systemctl is-enabled nord6.service        # should be: disabled
+  systemctl is-enabled nord6-switch.service # should be: enabled
+
+================================================================
+STEP 6 — RE-ENABLE OVERLAY (OPTIONAL)
+================================================================
+
+When you're done testing and want SD card protection back:
+
+  sudo raspi-config
+  -> Performance Options -> Overlay File System -> enable -> reboot
+
+================================================================
+REVERTING (IF YOU WANT THE OLD AUTOSTART BACK)
+================================================================
+If you ever want Nord6 to autostart on boot regardless of the
+switch, and to ignore the latching switch entirely:
+
+  sudo systemctl disable nord6-switch.service
+  sudo systemctl stop nord6-switch.service
+  sudo systemctl enable nord6.service
+  sudo systemctl start nord6.service
+  sudo reboot
+
+The switch will then have no effect (the watcher isn't running).
+
+================================================================
+HOW TO POWER DOWN THE PI ENTIRELY
+================================================================
+The latching switch no longer powers the Pi off — only starts/
+stops the Nord6 program. To power down the Pi cleanly:
+
+  sudo poweroff
+
+Or pull the cable — overlay protects the SD card.

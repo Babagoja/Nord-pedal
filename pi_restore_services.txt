@@ -1,0 +1,87 @@
+================================================================
+PI — RESTORE ALL DISABLED SERVICES
+================================================================
+
+Goal: bring the Pi back to a normal/stock state. Use this when
+you need SSH, the desktop GUI, or you're troubleshooting and
+want a fully-functional Pi.
+
+BEFORE running anything below: make sure the overlay filesystem
+is DISABLED so changes persist. Check with:
+  mount | grep overlay        (should return nothing)
+
+If overlay is enabled, disable it first:
+  sudo raspi-config
+    -> Performance Options -> Overlay File System -> No
+    -> Reboot, then come back to this file.
+
+================================================================
+STEP 1 — RE-ENABLE THE GRAPHICAL DESKTOP
+================================================================
+Run this and use the menu:
+
+  sudo raspi-config
+
+Navigate:
+  System Options
+    -> Boot / Auto Login
+      -> Desktop (or "Desktop Autologin" for auto-login)
+  Finish. Don't reboot yet — finish the rest first.
+
+================================================================
+STEP 2 — RE-ENABLE SERVICES
+================================================================
+Run each line:
+
+# Network
+sudo systemctl enable NetworkManager.service
+sudo systemctl enable NetworkManager-wait-online.service
+sudo systemctl enable wpa_supplicant.service
+sudo systemctl enable avahi-daemon.service
+
+# Bluetooth
+sudo systemctl enable bluetooth.service
+sudo systemctl enable hciuart.service
+
+# Boot/maintenance
+sudo systemctl enable e2scrub_reap.service
+sudo systemctl enable rpi-eeprom-update.service
+
+# Other
+sudo systemctl enable triggerhappy.service
+sudo systemctl enable ModemManager.service
+
+================================================================
+STEP 3 — REBOOT
+================================================================
+
+  sudo reboot
+
+After boot:
+  - Desktop GUI should appear (if you chose Desktop boot)
+  - Wi-Fi should reconnect if it was configured before
+  - SSH should work again
+
+================================================================
+VERIFY
+================================================================
+After reboot, confirm each came back:
+
+  systemctl is-enabled NetworkManager.service
+  systemctl is-enabled bluetooth.service
+  # etc — should print "enabled" for each
+
+To check Wi-Fi is connected:
+  hostname -I            (should print your local IP, e.g. 192.168.x.x)
+
+================================================================
+PARTIAL RESTORE
+================================================================
+If you only want SOME things back (e.g., just network for an
+SSH session, leave Bluetooth disabled), pick the lines you need
+from Step 2 and run only those.
+
+Smallest restore for SSH-only access:
+  sudo systemctl enable NetworkManager.service
+  sudo systemctl enable wpa_supplicant.service
+  sudo reboot

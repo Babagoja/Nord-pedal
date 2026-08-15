@@ -1,0 +1,94 @@
+================================================================
+PI STARTUP OPTIMIZATION — DISABLE UNNEEDED SERVICES
+================================================================
+
+Goal: cut Nord6 boot time by disabling services this dedicated
+pedalboard does not use. After running this, the Pi will:
+  - boot to console (no graphical desktop)
+  - have NO networking (no SSH, no Wi-Fi)
+  - have no Bluetooth
+  - skip boot housekeeping tasks that aren't needed
+
+Updates after this must be done via USB stick + direct keyboard
+on the Pi (or by booting once with networking re-enabled).
+
+BEFORE running anything below: make sure the overlay filesystem
+is DISABLED, otherwise all these changes get wiped on reboot.
+Check with:  mount | grep overlay   (should return nothing)
+
+================================================================
+STEP 1 — DISABLE THE GRAPHICAL DESKTOP
+================================================================
+Run this and use the menu:
+
+  sudo raspi-config
+
+Navigate:
+  System Options
+    -> Boot / Auto Login
+      -> Console (or "Console Autologin" if you want
+                  auto-login to the terminal as your user)
+  Then choose Finish. Don't reboot yet — finish the rest first.
+
+================================================================
+STEP 2 — DISABLE SERVICES
+================================================================
+Run each line. Copy-paste a block at a time is fine.
+
+# Network — fully kill since this Pi never connects
+sudo systemctl disable NetworkManager.service
+sudo systemctl disable NetworkManager-wait-online.service
+sudo systemctl disable wpa_supplicant.service
+sudo systemctl disable avahi-daemon.service
+
+# Bluetooth — unused on the pedalboard
+sudo systemctl disable bluetooth.service
+sudo systemctl disable hciuart.service
+
+# Boot/maintenance housekeeping not needed on a dedicated Pi
+sudo systemctl disable e2scrub_reap.service
+sudo systemctl disable rpi-eeprom-update.service
+
+# Other unused subsystems
+sudo systemctl disable triggerhappy.service
+sudo systemctl disable ModemManager.service
+
+================================================================
+STEP 3 — REBOOT AND MEASURE
+================================================================
+
+  sudo reboot
+
+Time how long it takes from reboot until the Nord's MIDI light
+glows. Compare to the previous 30-50s.
+
+After it boots:
+
+  systemd-analyze
+  systemd-analyze critical-chain Nord6.service
+
+================================================================
+WHAT EACH SERVICE DOES (FOR REFERENCE)
+================================================================
+NetworkManager                  Manages wired/Wi-Fi connections
+NetworkManager-wait-online      Blocks boot until network "ready"
+wpa_supplicant                  Wi-Fi auth handshake
+avahi-daemon                    mDNS (the .local hostname stuff)
+bluetooth / hciuart             Bluetooth stack + BT UART driver
+e2scrub_reap                    ext4/LVM cleanup (irrelevant on Pi)
+rpi-eeprom-update               Pi firmware update check on boot
+triggerhappy                    Input event multiplexer (unused)
+ModemManager                    Cellular modem support (unused)
+
+================================================================
+SAFETY NET
+================================================================
+This list is the SAME as in pi_restore_services.txt. Keep both
+files on the Pi (or at least a USB you can plug in) so you can
+always get back to a normal Pi if needed.
+
+If something goes wrong and the Pi won't boot at all:
+  - Power down (long-hold button 10 or pull cable as last resort)
+  - Boot it with a keyboard + monitor attached
+  - From console, run pi_restore_services.txt commands
+  - sudo reboot
