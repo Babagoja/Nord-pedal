@@ -1141,17 +1141,24 @@ class Nord6:
 
         if self.mb_sounding_note is None:
             self.mb_silent_since = None
-            if int(self.mb_pitch) != 0:
-                # The previous phrase left the wheel deflected and its release
-                # tail may still be ringing. Reanchor so the wheel stays put.
-                self._mb_reanchor(note)
-                return
+            # Every phrase starts from centre. Reanchoring onto a deflected
+            # wheel instead would leave the base sitting below the pitch you
+            # hear, so the whole reachable window (base +/- range) lies at or
+            # under it and every upward move reanchors rather than bends —
+            # heard as the bend simply not working any more. Centre before the
+            # note_on, not after, or the new note speaks sharp for a tick; the
+            # attack covers whatever tail is still fading.
+            self.mb_pitch = 0
+            self.mb_target = 0
+            if self.mb_last_sent != 0:
+                self.out.send(mido.Message(
+                    "pitchwheel", channel=self.CHANNEL, pitch=0
+                ))
+                self.mb_last_sent = 0
             self.out.send(mido.Message(
                 "note_on", note=note, velocity=100, channel=self.CHANNEL
             ))
             self.mb_sounding_note = note
-            self.mb_target = 0
-            self.mb_pitch = 0
             self._harm_attach_voice(note)
             return
 

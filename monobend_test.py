@@ -131,18 +131,20 @@ class MonobendBench:
 
             if self.sounding is None:
                 self.silent_since = None
-                if int(self.pitch) != 0:
-                    self._t(f"press {note_name(note)}: wheel still deflected "
-                            f"from the last phrase -> REANCHOR")
-                    self._reanchor(note)
-                    return
-                self._note_on(note)
-                self.sounding = note
+                # Centre before the note_on. A phrase that starts on a
+                # deflected wheel has its base below the pitch you hear, so
+                # every upward move is out of range and reanchors instead of
+                # bending — the bend appears to stop working.
+                was = int(self.pitch)
                 self.pitch = 0.0
                 self.target = 0
-                self._bend(0)
-                self.last_sent = 0
-                self._t(f"press {note_name(note)}: nothing sounding -> play it")
+                if self.last_sent != 0:
+                    self._bend(0)
+                    self.last_sent = 0
+                self._note_on(note)
+                self.sounding = note
+                self._t(f"press {note_name(note)}: nothing sounding -> play it"
+                        + (f" (wheel recentred from {was})" if was else ""))
                 return
 
             diff = note - self.sounding
