@@ -30,9 +30,9 @@ CHANNEL = 15                 # MIDI channel 16, matching Nord6.py
 SC_DT = 0.01                 # 100 Hz output loop
 SUSTAIN_CC = 64
 
-SC_FLOOR_DEFAULT = 38
-SC_LENGTH_DEFAULT = 0.35
-SC_CURVE_DEFAULT = 2.0
+SC_FLOOR_DEFAULT = 30
+SC_LENGTH_DEFAULT = 0.3
+SC_CURVE_DEFAULT = 4.0
 
 # The value the envelope returns to, and the most we ever send. NOT assumed to
 # be 127: if the Nord rests below that, restoring to 127 would leave a quiet
@@ -42,7 +42,9 @@ SC_CEILING_DEFAULT = 127
 SC_LENGTH_MIN = 0.03
 SC_LENGTH_MAX = 1.5
 SC_CURVE_MIN = 1.0
-SC_CURVE_MAX = 4.0
+# Widened from 4.0: on hardware the most aggressive setting available was the
+# one that got picked, which usually means the range was the limit, not taste.
+SC_CURVE_MAX = 6.0
 
 KNOB_FLOOR = 102
 KNOB_LENGTH = 103
