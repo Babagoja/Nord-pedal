@@ -37,15 +37,44 @@ class Nord6:
     ARP_RETRIGGER_DEBOUNCE = 0.12
 
     # ----------------------------
+    # SIDECHAIN CONSTANTS (CEFFECT_3)
+    # ----------------------------
+    # Pedal-triggered volume duck. One duck per sustain press, so the player is
+    # the clock and it can never drift against a live drummer.
+    SC_DT = 0.01                          # 100 Hz output loop
+    SC_VOLUME_CC = 7                      # channel volume; nothing reads CC7 as input
+    SC_FLOOR_DEFAULT = 30                 # tuned on hardware at 120bpm
+    SC_LENGTH_DEFAULT = 0.3
+    SC_CURVE_DEFAULT = 4.0
+    SC_LENGTH_MIN = 0.03
+    SC_LENGTH_MAX = 1.5
+    SC_CURVE_MIN = 1.0
+    SC_CURVE_MAX = 6.0
+    # The value the duck returns to, and the most we ever send. Measured as 127
+    # on this Nord with sidechain_test.py's `ref`; kept configurable because the
+    # General MIDI default for channel volume is 100, and restoring above the
+    # resting value would leave a quiet patch louder than the player set it.
+    SC_CEILING_DEFAULT = 127
+    # Knobs claimed only while shift is held — see _handle_cc. Unmodified, these
+    # keep their existing jobs (102 pan, 103 mod amplitude, 107 mod frequency).
+    SC_KNOB_FLOOR = 102
+    SC_KNOB_LENGTH = 103
+    SC_KNOB_CURVE = 107
+
+    # ----------------------------
     # PRESET SYSTEM
     # ----------------------------
     # Slot 1 is the read-only base; mirrors the __init__ defaults below.
     # Slots 2-5 are saveable and persisted to PRESETS_PATH. Pointer starts
     # at 3 every startup (not persisted).
     BASE_PRESET = {
-        "effects": {"CEFFECT_1": False, "CEFFECT_2": False,
+        "effects": {"CEFFECT_1": False, "CEFFECT_2": False, "CEFFECT_3": False,
                     "CEFFECT_4": False, "CEFFECT_5": False, "CEFFECT_6": False},
         "pan_value": None,
+        "sc_floor": SC_FLOOR_DEFAULT,
+        "sc_length": SC_LENGTH_DEFAULT,
+        "sc_curve": SC_CURVE_DEFAULT,
+        "sc_ceiling": SC_CEILING_DEFAULT,
         "mod_frequency": 7.5,
         "mod_amplitude": 1200,
         "harmonizer_interval": 0,
@@ -170,11 +199,23 @@ class Nord6:
         self.arp_last_retrigger = 0.0
 
         # ----------------------------
+        # SIDECHAIN STATE (CEFFECT_3) — guarded by self.sc_lock
+        # ----------------------------
+        self.sc_lock = threading.Lock()
+        self.sc_floor = self.SC_FLOOR_DEFAULT
+        self.sc_length = self.SC_LENGTH_DEFAULT
+        self.sc_curve = self.SC_CURVE_DEFAULT
+        self.sc_ceiling = self.SC_CEILING_DEFAULT
+        self.sc_trigger_time = None      # None = idle, sitting at the ceiling
+        self.sc_last_sent = self.SC_CEILING_DEFAULT
+
+        # ----------------------------
         # EFFECT REGISTRY
         # ----------------------------
         self.effects = {
             "CEFFECT_1": False,   # pan
             "CEFFECT_2": False,   # modulation
+            "CEFFECT_3": False,   # sidechain
             "CEFFECT_4": False,   # arpeggiator
             "CEFFECT_5": False,   # monobend
             "CEFFECT_6": False,   # harmonizer
@@ -189,7 +230,8 @@ class Nord6:
             91:  "CEFFECT_2",   # modulation
             97:  "CEFFECT_6",   # harmonizer
             116: "CEFFECT_5",   # monobend
-            # 118: bounce only (used as ctrl+CC pedal-target for mod_amplitude)
+            118: "CEFFECT_3",   # sidechain (ctrl+118 stays the mod_amplitude
+                                # pedal-target bind — different modifier)
         }
 
         # ----------------------------
@@ -287,6 +329,7 @@ class Nord6:
         threading.Thread(target=self._lfo_loop, daemon=True).start()
         threading.Thread(target=self._mb_loop, daemon=True).start()
         threading.Thread(target=self._arp_loop, daemon=True).start()
+        threading.Thread(target=self._sidechain_loop, daemon=True).start()
 
         self._setup_inputs()
 
@@ -414,6 +457,7 @@ class Nord6:
             "arp":   24,
             "mb":    20,
             "harm":  21,
+            "sc":    23,
             "power": 25,
         }
         for name, pin in LED_PINS.items():
@@ -486,6 +530,14 @@ class Nord6:
     # SUSTAIN PEDAL
     # ----------------------------
     def _handle_sustain(self, value):
+        # Sidechain claims the pedal outright: a press fires one duck, and the
+        # release does nothing. No note sustain, no arp chord-freeze — holding
+        # the pedal down must not leave notes or a frozen chord stranded.
+        if self.effects["CEFFECT_3"]:
+            if value >= 64:
+                self._sc_trigger()
+            return
+
         self.sustain_on = value >= 64
 
         if not self.sustain_on:
@@ -541,6 +593,32 @@ class Nord6:
             self.harmonizer_interval = semitones
             print(f"[HARMONIZER] interval = {semitones:+d} semitones")
             return
+
+        # Sidechain claims its three knobs ONLY while shift is held, so pan
+        # (102), mod amplitude (103) and mod frequency (107) keep working
+        # normally even with CEFFECT_3 on. Must run before _handle_arp_cc and
+        # before the CC103 mod-amplitude path below.
+        if self.shift_held and self.effects["CEFFECT_3"]:
+            if cc == self.SC_KNOB_FLOOR:
+                with self.sc_lock:
+                    self.sc_floor = min(value, self.sc_ceiling)
+                    floor = self.sc_floor
+                print(f"[SIDECHAIN] floor = {floor}")
+                return
+            if cc == self.SC_KNOB_LENGTH:
+                with self.sc_lock:
+                    self.sc_length = self.SC_LENGTH_MIN + (value / 127) * (
+                        self.SC_LENGTH_MAX - self.SC_LENGTH_MIN)
+                    length = self.sc_length
+                print(f"[SIDECHAIN] length = {round(length, 3)}s")
+                return
+            if cc == self.SC_KNOB_CURVE:
+                with self.sc_lock:
+                    self.sc_curve = self.SC_CURVE_MIN + (value / 127) * (
+                        self.SC_CURVE_MAX - self.SC_CURVE_MIN)
+                    curve = self.sc_curve
+                print(f"[SIDECHAIN] curve = {round(curve, 2)}")
+                return
 
         # Arp-specific CCs (tempo knob, pattern, subdivision, tap, custom slots,
         # octavizer, etc.) are consumed before the generic Nord6 paths.
@@ -632,6 +710,8 @@ class Nord6:
             self._set_pan(new_state)
         elif effect == "CEFFECT_2":
             self._set_mod(new_state)
+        elif effect == "CEFFECT_3":
+            self._set_sidechain(new_state)
         elif effect == "CEFFECT_4":
             self._set_arp(new_state)
         elif effect == "CEFFECT_5":
@@ -650,6 +730,7 @@ class Nord6:
         self.effects[effect] = new_state
         if   effect == "CEFFECT_1": self._set_pan(new_state)
         elif effect == "CEFFECT_2": self._set_mod(new_state)
+        elif effect == "CEFFECT_3": self._set_sidechain(new_state)
         elif effect == "CEFFECT_4": self._set_arp(new_state)
         elif effect == "CEFFECT_5": self._set_monobend(new_state)
         elif effect == "CEFFECT_6": self._set_harmonizer(new_state)
@@ -672,6 +753,7 @@ class Nord6:
         mapping = {
             "CEFFECT_1": "pan",
             "CEFFECT_2": "mod",
+            "CEFFECT_3": "sc",
             "CEFFECT_4": "arp",
             "CEFFECT_5": "mb",
             "CEFFECT_6": "harm",
@@ -687,8 +769,13 @@ class Nord6:
     def _preset_capture(self):
         return {
             "effects": {ef: self.effects[ef] for ef in
-                        ("CEFFECT_1", "CEFFECT_2", "CEFFECT_4", "CEFFECT_5", "CEFFECT_6")},
+                        ("CEFFECT_1", "CEFFECT_2", "CEFFECT_3",
+                         "CEFFECT_4", "CEFFECT_5", "CEFFECT_6")},
             "pan_value": self.pan_value,
+            "sc_floor": self.sc_floor,
+            "sc_length": self.sc_length,
+            "sc_curve": self.sc_curve,
+            "sc_ceiling": self.sc_ceiling,
             "mod_frequency": self.mod_frequency,
             "mod_amplitude": self.mod_amplitude,
             "harmonizer_interval": self.harmonizer_interval,
@@ -724,14 +811,25 @@ class Nord6:
         self.arp_live_retrigger = p["arp_live_retrigger"]
         self.pedal_targets = set(p["pedal_targets"])
 
+        # Sidechain keys read via .get: presets saved before CEFFECT_3 existed
+        # do not carry them, and a bare p["key"] would KeyError and brick the
+        # slot. Same reason target.get(...) is used for the effect below.
+        with self.sc_lock:
+            self.sc_floor = p.get("sc_floor", self.SC_FLOOR_DEFAULT)
+            self.sc_length = p.get("sc_length", self.SC_LENGTH_DEFAULT)
+            self.sc_curve = p.get("sc_curve", self.SC_CURVE_DEFAULT)
+            self.sc_ceiling = p.get("sc_ceiling", self.SC_CEILING_DEFAULT)
+
         # Effect on/off transitions: force-off first then on, so cleanup
         # side-effects run before any new effect arms.
         target = p["effects"]
-        for ef in ("CEFFECT_4", "CEFFECT_6", "CEFFECT_1", "CEFFECT_2", "CEFFECT_5"):
-            if self.effects[ef] and not target[ef]:
+        for ef in ("CEFFECT_4", "CEFFECT_6", "CEFFECT_1", "CEFFECT_2",
+                   "CEFFECT_3", "CEFFECT_5"):
+            if self.effects[ef] and not target.get(ef, False):
                 self._set_effect_state(ef, False)
-        for ef in ("CEFFECT_1", "CEFFECT_2", "CEFFECT_4", "CEFFECT_5", "CEFFECT_6"):
-            if not self.effects[ef] and target[ef]:
+        for ef in ("CEFFECT_1", "CEFFECT_2", "CEFFECT_3",
+                   "CEFFECT_4", "CEFFECT_5", "CEFFECT_6"):
+            if not self.effects[ef] and target.get(ef, False):
                 self._set_effect_state(ef, True)
 
         # Defensive mutex: if a hand-edited preset has both arp and
@@ -1021,6 +1119,105 @@ class Nord6:
                     self.last_sent_pan = pan_out
 
             time.sleep(self.PAN_DT)
+
+    # ----------------------------
+    # SIDECHAIN (CEFFECT_3) — pedal-triggered volume duck
+    # ----------------------------
+    def _sc_value(self, elapsed, floor, length, curve, ceiling):
+        """Instant drop to floor, then an accelerating power-curve climb back.
+
+        Hangs low and rushes up at the end — the drawn sidechain shape rather
+        than a real compressor's release. Never returns above the ceiling, so
+        the duck can only attenuate; it cannot leave a patch louder than the
+        player set it.
+        """
+        floor = min(floor, ceiling)
+        if elapsed >= length:
+            return ceiling
+        frac = elapsed / length
+        return int(round(floor + (ceiling - floor) * (frac ** curve)))
+
+    def _sc_send(self, value):
+        try:
+            self.out.send(mido.Message(
+                "control_change", control=self.SC_VOLUME_CC,
+                value=value, channel=self.CHANNEL
+            ))
+        except Exception as e:
+            print(f"[SIDECHAIN] send failed: {e}")
+
+    def _sc_trigger(self):
+        with self.sc_lock:
+            self.sc_trigger_time = time.time()
+            floor = min(self.sc_floor, self.sc_ceiling)
+            send = floor != self.sc_last_sent
+            if send:
+                self.sc_last_sent = floor
+        # Drop on the pedal's own thread rather than waiting up to SC_DT for
+        # the output loop's next tick: a piano or synth attack peaks within a
+        # few ms, and a 10ms late duck lets the transient through at full level.
+        if send:
+            self._sc_send(floor)
+
+    def _sc_restore(self):
+        """Volume back to the ceiling, duck cancelled.
+
+        A stuck duck leaves the instrument quiet with no obvious cause, so
+        every path that stops sidechaining must land here.
+        """
+        with self.sc_lock:
+            self.sc_trigger_time = None
+            self.sc_last_sent = self.sc_ceiling
+            ceiling = self.sc_ceiling
+        self._sc_send(ceiling)
+
+    def _sidechain_loop(self):
+        while not self.stop_event.is_set():
+            if self.active and self.effects["CEFFECT_3"]:
+                with self.sc_lock:
+                    t = self.sc_trigger_time
+                    floor, length = self.sc_floor, self.sc_length
+                    curve, ceiling = self.sc_curve, self.sc_ceiling
+
+                if t is None:
+                    value = ceiling
+                else:
+                    elapsed = time.time() - t
+                    value = self._sc_value(elapsed, floor, length, curve, ceiling)
+                    if elapsed >= length:
+                        with self.sc_lock:
+                            # Only clear if no re-trigger landed meanwhile.
+                            if self.sc_trigger_time == t:
+                                self.sc_trigger_time = None
+
+                # Emit only on change, mirroring _pan_loop's last_sent_pan idiom.
+                with self.sc_lock:
+                    send = value != self.sc_last_sent
+                    if send:
+                        self.sc_last_sent = value
+                if send:
+                    self._sc_send(value)
+
+            time.sleep(self.SC_DT)
+
+    def _set_sidechain(self, state):
+        if state:
+            # Enabling mid-song: flush any sustain the pedal is already holding,
+            # or those notes and the frozen arp chord are stranded — the pedal
+            # stops reporting releases the moment sidechain owns it.
+            for n in self.sustain_held_notes:
+                try:
+                    self.out.send(mido.Message(
+                        "note_off", note=n, velocity=0, channel=self.CHANNEL
+                    ))
+                except Exception as e:
+                    print(f"[SIDECHAIN] flush note_off failed: {e}")
+            self.sustain_held_notes.clear()
+            self._arp_set_sustain(False)
+            self.sustain_on = False
+        else:
+            self._sc_restore()
+        print(f"[SIDECHAIN] {'ON' if state else 'OFF'}")
 
     # ----------------------------
     # ARP ON/OFF
@@ -1487,6 +1684,8 @@ class Nord6:
         self.harmonizer_active.clear()
         self.sustain_held_notes.clear()
         self.sustain_on = False
+        # Pausing mid-duck must not leave the instrument quiet.
+        self._sc_restore()
         self.active = False
         if "power" in self._leds:
             self._leds["power"].off()
@@ -1515,6 +1714,10 @@ class Nord6:
             mido.Message("control_change", control=123, value=0, channel=self.CHANNEL),
             mido.Message("pitchwheel", pitch=0, channel=self.CHANNEL),
             mido.Message("control_change", control=10, value=64, channel=self.CHANNEL),
+            # Restore channel volume: quitting mid-duck must not leave the Nord
+            # silent with no obvious cause.
+            mido.Message("control_change", control=self.SC_VOLUME_CC,
+                         value=self.sc_ceiling, channel=self.CHANNEL),
         ):
             try:
                 self.out.send(msg)
