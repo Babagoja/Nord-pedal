@@ -476,13 +476,19 @@ class Nord6:
         print(f"[Nord6] GPIO buttons configured: {sorted(PINS.values())}")
 
         # LED setup
+        # Only six LEDs are physically wired. Sidechain gets the one that used
+        # to show modulation, that being the least-used effect; "mod" now
+        # points at BCM 23, which has nothing attached. Wire an LED there and
+        # modulation lights up again with no code change — _update_effect_leds
+        # already drives every entry, and _leds.get() makes an absent pin a
+        # no-op rather than an error.
         LED_PINS = {
             "pan":   4,
-            "mod":   18,
+            "sc":    18,   # was mod
             "arp":   24,
             "mb":    20,
             "harm":  21,
-            "sc":    23,
+            "mod":   23,   # unwired spare
             "power": 25,
         }
         for name, pin in LED_PINS.items():
