@@ -140,8 +140,9 @@ class SidechainBench:
         # BENCH STATE
         # ----------------------------
         self.monitor = False
-        self.drone_note = None
+        self.drone_notes = []
         self.auto_bpm = None
+        self.restrike_every = 0          # 0 = never; N = re-strike every N hits
         self.cc_in_count = {}            # incoming CC -> count, for reflection detection
         self._probing = False            # suppresses the output loop during a probe
 
@@ -203,12 +204,19 @@ class SidechainBench:
     # AUTO-FIRE LOOP
     # ----------------------------
     def _auto_loop(self):
+        hits = 0
         while not self.stop_event.is_set():
             bpm = self.auto_bpm
             if bpm is None:
+                hits = 0
                 time.sleep(0.02)
                 continue
+            # Re-strike on the same tick as the duck, so the chord lands with
+            # the hit rather than drifting against it.
+            if self.restrike_every and hits % self.restrike_every == 0:
+                self._drone_restrike()
             self._sc_trigger()
+            hits += 1
             time.sleep(60.0 / bpm)
 
     # ----------------------------
@@ -254,22 +262,35 @@ class SidechainBench:
     # DRONE
     # ----------------------------
     def _drone_off(self):
-        if self.drone_note is not None and self.out is not None:
-            self.out.send(mido.Message(
-                "note_off", note=self.drone_note, velocity=0, channel=CHANNEL
-            ))
-        self.drone_note = None
+        if self.out is not None:
+            for n in self.drone_notes:
+                self.out.send(mido.Message(
+                    "note_off", note=n, velocity=0, channel=CHANNEL
+                ))
+        self.drone_notes = []
 
-    def _drone_on(self, note):
+    def _drone_on(self, notes):
         self._drone_off()
         if self.out is None:
             print("[DRONE] no output")
             return
-        self.out.send(mido.Message(
-            "note_on", note=note, velocity=100, channel=CHANNEL
-        ))
-        self.drone_note = note
-        print(f"[DRONE] note {note} sounding")
+        for n in notes:
+            self.out.send(mido.Message(
+                "note_on", note=n, velocity=100, channel=CHANNEL
+            ))
+        self.drone_notes = list(notes)
+        print(f"[DRONE] sounding: {' '.join(str(n) for n in notes)}")
+
+    def _drone_restrike(self):
+        """Re-play the held chord. Decaying patches (piano, EP) fade out well
+        before you have heard enough ducks to judge the shape."""
+        if self.out is None or not self.drone_notes:
+            return
+        notes = list(self.drone_notes)
+        for n in notes:
+            self.out.send(mido.Message("note_off", note=n, velocity=0, channel=CHANNEL))
+        for n in notes:
+            self.out.send(mido.Message("note_on", note=n, velocity=100, channel=CHANNEL))
 
     # ----------------------------
     # PROBE — the critical test
@@ -284,7 +305,7 @@ class SidechainBench:
         if self.out is None:
             print("[PROBE] no output — connect the Nord first")
             return
-        if self.drone_note is None:
+        if not self.drone_notes:
             print("[PROBE] nothing sounding. Run `drone B3` (or play a key) first.")
             return
 
@@ -353,7 +374,7 @@ class SidechainBench:
                 "patch and must come down.\n"
             )
             return
-        if self.drone_note is None:
+        if not self.drone_notes:
             print("[REF] nothing sounding. Run `drone B3` first.")
             return
 
@@ -383,7 +404,7 @@ class SidechainBench:
         if self.out is None:
             print("[FIND] no output — connect the Nord first")
             return
-        if self.drone_note is None:
+        if not self.drone_notes:
             print("[FIND] nothing sounding. Run `drone B3` first.")
             return
 
@@ -431,7 +452,8 @@ class SidechainBench:
   probe             sweep CC11 then CC7 while a drone sounds — the critical test
   ref [go]          does our ceiling exceed the patch's own level? read `ref` first
   find [step]       step the volume CC down to find the patch's resting value
-  drone <note|off>  hold/release a sustained note (e.g. drone B3)
+  drone <notes|off> hold/release a chord (e.g. drone B3 D4 E4 G4)
+  restrike <n|off>  re-play the chord every n auto hits, for decaying patches
   hit               fire one envelope manually
   floor <0-127>     duck floor (0 = silence on each hit, ceiling = no duck)
   ceiling <0-127>   value the duck returns to — never sends above this
@@ -495,7 +517,7 @@ class SidechainBench:
         elif cmd == "chscan":
             # Which MIDI channel does each section listen on? Duck CC7 hard on
             # one channel at a time and hear which part of the sound drops out.
-            if self.out is None or self.drone_note is None:
+            if self.out is None or not self.drone_notes:
                 print("[CHSCAN] needs an output and a sounding drone "
                       "(play a patch with more than one section active)")
             else:
@@ -519,16 +541,29 @@ class SidechainBench:
 
         elif cmd == "drone":
             if not args:
-                print("usage: drone <note|off>")
+                print("usage: drone <note...|off>   e.g. drone B3 D4 E4 G4")
             elif args[0].lower() == "off":
                 self._drone_off()
                 print("[DRONE] off")
             else:
-                note = parse_note(args[0])
-                if note is None:
-                    print(f"bad note: {args[0]}")
+                notes = [parse_note(a) for a in args]
+                bad = [a for a, n in zip(args, notes) if n is None]
+                if bad:
+                    print(f"bad note(s): {' '.join(bad)}")
                 else:
-                    self._drone_on(note)
+                    self._drone_on(notes)
+
+        elif cmd == "restrike":
+            if args and args[0].lower() == "off":
+                self.restrike_every = 0
+                print("[RESTRIKE] off")
+            else:
+                try:
+                    self.restrike_every = max(0, int(args[0]))
+                    print(f"[RESTRIKE] every {self.restrike_every} hits"
+                          if self.restrike_every else "[RESTRIKE] off")
+                except (IndexError, ValueError):
+                    print("usage: restrike <n|off>   e.g. restrike 4")
 
         elif cmd == "hit":
             self._sc_trigger()
@@ -587,7 +622,8 @@ class SidechainBench:
             print(f"floor={self.sc_floor}  ceiling={self.sc_ceiling}  "
                   f"length={round(self.sc_length, 3)}s  "
                   f"curve={round(self.sc_curve, 2)}  cc={self.sc_volume_cc}  "
-                  f"drone={self.drone_note}  auto={self.auto_bpm}  mon={self.monitor}")
+                  f"drone={self.drone_notes}  auto={self.auto_bpm}  "
+                  f"restrike={self.restrike_every}  mon={self.monitor}")
 
         elif cmd == "panic":
             self._panic()
