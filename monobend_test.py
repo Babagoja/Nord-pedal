@@ -91,6 +91,8 @@ class MonobendBench:
         self.glide_ms = 120          # time: ms to cover the whole span
         self.glide = "linear"        # linear | ease | time
         self.out_of_range = "reanchor"   # reanchor | ignore | retrigger | clamp
+        self.recentre_delay = 1.5    # seconds of silence before the wheel resets
+        self.silent_since = None
         self.monitor = False
         self.trace = True            # print the branch taken on every note event
         self.velocity = 100
@@ -128,6 +130,12 @@ class MonobendBench:
                 self.held.append(note)
 
             if self.sounding is None:
+                self.silent_since = None
+                if int(self.pitch) != 0:
+                    self._t(f"press {note_name(note)}: wheel still deflected "
+                            f"from the last phrase -> REANCHOR")
+                    self._reanchor(note)
+                    return
                 self._note_on(note)
                 self.sounding = note
                 self.pitch = 0.0
@@ -165,9 +173,13 @@ class MonobendBench:
             if not self.held:
                 if self.sounding is not None:
                     self._note_off(self.sounding)
-                self._t(f"release {note_name(note)}: nothing held -> note off")
+                self._t(f"release {note_name(note)}: nothing held -> note off, "
+                        f"wheel frozen at {int(self.pitch)}")
                 self.sounding = None
-                self.target = 0
+                # Freeze rather than glide back to centre: the wheel is
+                # channel-wide and would drag the note's release tail with it.
+                self.target = int(self.pitch)
+                self.silent_since = time.time()
                 return
 
             newest = self.held[-1]
@@ -262,6 +274,12 @@ class MonobendBench:
     def _loop(self):
         while not self.stop_event.is_set():
             with self.lock:
+                if (self.sounding is None and self.silent_since is not None
+                        and time.time() - self.silent_since >= self.recentre_delay):
+                    self.pitch = 0.0
+                    self.target = 0
+                    self.silent_since = None
+                    self._t("(silence) wheel recentred")
                 target = self.target
                 if self.glide == "linear":
                     step = self.bend_speed
@@ -284,7 +302,8 @@ class MonobendBench:
                     self.pitch = max(self.pitch - step, target)
 
                 value = int(self.pitch)
-                send = value != self.last_sent and self.sounding is not None
+                # Also emit while nothing sounds, so the delayed recentre lands.
+                send = value != self.last_sent
                 if send:
                     self.last_sent = value
 
@@ -344,6 +363,7 @@ class MonobendBench:
   speed <n>          linear: bend units per 10ms tick (Nord6 default 2000)
   ease <0.01-1.0>    ease: fraction of the remaining distance per tick
   ms <n>             time: milliseconds to cover the full bend span
+  recentre <sec>     silence before the wheel resets to centre (0 = never)
   oor <mode>         out-of-range note:
                        reanchor  play it without moving the wheel (default)
                        retrigger play it and recentre the wheel
@@ -389,6 +409,10 @@ class MonobendBench:
             elif cmd == "ms":
                 self.glide_ms = int(clamp(num(0, int), 10, 5000))
                 print(f"[MB] glide time = {self.glide_ms}ms for the full span")
+            elif cmd == "recentre":
+                self.recentre_delay = clamp(num(0), 0.0, 30.0)
+                print(f"[MB] recentre after {self.recentre_delay}s of silence"
+                      if self.recentre_delay else "[MB] wheel never auto-recentres")
             elif cmd == "oor":
                 if args and args[0] in ("reanchor", "ignore", "retrigger", "clamp"):
                     self.out_of_range = args[0]
@@ -408,6 +432,7 @@ class MonobendBench:
                 print(f"range=+/-{self.semitone_range}  glide={self.glide}  "
                       f"speed={self.bend_speed}  ease={self.ease_factor}  "
                       f"ms={self.glide_ms}  oor={self.out_of_range}  "
+                      f"recentre={self.recentre_delay}s  "
                       f"vel={self.velocity}\n"
                       f"held={[note_name(n) for n in self.held]}  "
                       f"sounding={note_name(self.sounding) if self.sounding is not None else None}  "

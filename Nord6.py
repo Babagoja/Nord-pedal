@@ -321,6 +321,11 @@ class Nord6:
         # anything wider has to be reached by re-triggering rather than bending.
         self.MB_SEMITONE_RANGE = 2
         self.MB_DT = 0.01
+        # After the last key comes up the wheel is left where it is, so the
+        # release tail keeps its pitch. Once nothing has sounded for this long
+        # the tail is gone and the wheel can safely snap back to centre.
+        self.MB_RECENTRE_DELAY = 1.5
+        self.mb_silent_since = None
 
         # ----------------------------
         # HARMONIZER STATE (CEFFECT_6)
@@ -1043,6 +1048,7 @@ class Nord6:
                 "pitchwheel", channel=self.CHANNEL, pitch=0
             ))
             self.mb_last_sent = 0
+            self.mb_silent_since = None
         else:
             # The LFO writes the same pitchwheel while monobend is off, so what
             # we last sent tells us nothing about where the wheel now sits.
@@ -1134,6 +1140,12 @@ class Nord6:
             self.mb_held_notes.append(note)
 
         if self.mb_sounding_note is None:
+            self.mb_silent_since = None
+            if int(self.mb_pitch) != 0:
+                # The previous phrase left the wheel deflected and its release
+                # tail may still be ringing. Reanchor so the wheel stays put.
+                self._mb_reanchor(note)
+                return
             self.out.send(mido.Message(
                 "note_on", note=note, velocity=100, channel=self.CHANNEL
             ))
@@ -1160,7 +1172,12 @@ class Nord6:
                     "note_off", note=self.mb_sounding_note, velocity=0, channel=self.CHANNEL
                 ))
             self.mb_sounding_note = None
-            self.mb_target = 0
+            # Freeze the wheel rather than gliding it back to centre. The note
+            # just released is still in its release tail, and the wheel is
+            # channel-wide, so returning to 0 would drag that dying voice down
+            # with it — heard as the pitch sagging after the key comes up.
+            self.mb_target = int(self.mb_pitch)
+            self.mb_silent_since = time.time()
             return
 
         newest = self.mb_held_notes[-1]
@@ -1223,7 +1240,16 @@ class Nord6:
     def _mb_loop(self):
         while not self.stop_event.is_set():
             if self.active and self.effects["CEFFECT_5"]:
-                if self.mb_pitch < self.mb_target:
+                if (self.mb_sounding_note is None
+                        and self.mb_silent_since is not None
+                        and time.time() - self.mb_silent_since >= self.MB_RECENTRE_DELAY):
+                    # Nothing has sounded for long enough that the release tail
+                    # is gone; snap rather than glide, so the next phrase starts
+                    # with the full bend range in both directions.
+                    self.mb_pitch = 0.0
+                    self.mb_target = 0
+                    self.mb_silent_since = None
+                elif self.mb_pitch < self.mb_target:
                     self.mb_pitch += self.bend_speed
                     if self.mb_pitch > self.mb_target:
                         self.mb_pitch = self.mb_target
