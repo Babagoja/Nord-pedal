@@ -164,6 +164,14 @@ class SidechainBench:
 
     def _sc_trigger(self):
         self.sc_trigger_time = time.time()
+        # Drop on this thread rather than waiting up to SC_DT for the output
+        # loop's next tick. A piano or synth attack peaks within a few ms, so a
+        # 10ms late duck lets the transient through at full volume — audible as
+        # the chord "hitting hard" straight through the duck.
+        floor = min(self.sc_floor, self.sc_ceiling)
+        if floor != self.sc_last_sent:
+            self._sc_send(floor)
+            self.sc_last_sent = floor
 
     def _sc_send(self, value):
         if self.out is None:
@@ -211,11 +219,11 @@ class SidechainBench:
                 hits = 0
                 time.sleep(0.02)
                 continue
-            # Re-strike on the same tick as the duck, so the chord lands with
-            # the hit rather than drifting against it.
+            # Duck first, then strike: the volume must already be at the floor
+            # when the note-ons land, or the attack punches through it.
+            self._sc_trigger()
             if self.restrike_every and hits % self.restrike_every == 0:
                 self._drone_restrike()
-            self._sc_trigger()
             hits += 1
             time.sleep(60.0 / bpm)
 
