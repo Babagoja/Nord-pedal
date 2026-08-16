@@ -90,7 +90,7 @@ class MonobendBench:
         self.ease_factor = 0.25      # ease: fraction of remaining distance per tick
         self.glide_ms = 120          # time: ms to cover the whole span
         self.glide = "linear"        # linear | ease | time
-        self.out_of_range = "ignore" # ignore | retrigger | clamp
+        self.out_of_range = "reanchor"   # reanchor | ignore | retrigger | clamp
         self.monitor = False
         self.trace = True            # print the branch taken on every note event
         self.velocity = 100
@@ -142,6 +142,10 @@ class MonobendBench:
                 self.target = self._target_for(note)
                 self._t(f"press {note_name(note)}: {diff:+d} semis from "
                         f"{note_name(self.sounding)} -> BEND (target {self.target})")
+            elif self.out_of_range == "reanchor":
+                self._t(f"press {note_name(note)}: {diff:+d} semis, out of range "
+                        f"-> REANCHOR")
+                self._reanchor(note)
             elif self.out_of_range == "retrigger":
                 self._t(f"press {note_name(note)}: {diff:+d} semis, out of range "
                         f"-> RETRIGGER as a new note")
@@ -174,6 +178,11 @@ class MonobendBench:
                         f"{note_name(newest)} -> BEND (target {self.target})")
                 return
 
+            if self.out_of_range == "reanchor":
+                self._t(f"release {note_name(note)}: newest held "
+                        f"{note_name(newest)} out of range -> REANCHOR")
+                self._reanchor(newest)
+                return
             if self.out_of_range == "retrigger":
                 self._t(f"release {note_name(note)}: newest held "
                         f"{note_name(newest)} out of range -> RETRIGGER")
@@ -203,6 +212,35 @@ class MonobendBench:
                 # The sounding note itself is gone and nothing reachable is
                 # left, so there is no voice to bend — take the newest.
                 self._retrigger(newest)
+
+    def _reanchor(self, want):
+        """Move to `want` without touching the wheel.
+
+        The wheel is channel-wide, so recentring it also drags any voice still
+        in its release tail. That is what makes the original note audibly slide
+        back in on a retrigger. Here the wheel stays put and we trigger a note
+        offset by however much bend is currently applied, so the new voice
+        lands on the right pitch and nothing already sounding moves.
+        """
+        bend_semis = (self.pitch / MAX_BEND) * self.semitone_range
+        base = int(round(want - bend_semis))
+        residual = want - base                       # semitones the wheel must supply
+        new_pitch = clamp(residual / self.semitone_range * MAX_BEND, -MAX_BEND, MAX_BEND)
+
+        if self.sounding is not None:
+            self._note_off(self.sounding)
+        # Usually zero: when the wheel is parked at full deflection the offset
+        # is a whole number of semitones and nothing needs to move at all.
+        if int(new_pitch) != self.last_sent:
+            self._bend(int(new_pitch))
+            self.last_sent = int(new_pitch)
+        self.pitch = float(new_pitch)
+        self.target = int(new_pitch)
+        self._note_on(base)
+        self.sounding = base
+        self._t(f"   reanchor: play {note_name(base)} with wheel at "
+                f"{int(new_pitch)} -> sounds {note_name(want)}"
+                + ("  (wheel did not move)" if residual == 0 else ""))
 
     def _retrigger(self, note):
         """Swap the sounding voice. Caller holds the lock."""
@@ -306,7 +344,11 @@ class MonobendBench:
   speed <n>          linear: bend units per 10ms tick (Nord6 default 2000)
   ease <0.01-1.0>    ease: fraction of the remaining distance per tick
   ms <n>             time: milliseconds to cover the full bend span
-  oor <mode>         out-of-range note: ignore | retrigger | clamp
+  oor <mode>         out-of-range note:
+                       reanchor  play it without moving the wheel (default)
+                       retrigger play it and recentre the wheel
+                       ignore    drop it (Nord6.py's behaviour today)
+                       clamp     bend as far as the range allows
   vel <1-127>        velocity for triggered notes
   mon <on|off>       print incoming notes
   trace <on|off>     print the decision taken on every note event (on by default)
@@ -348,11 +390,11 @@ class MonobendBench:
                 self.glide_ms = int(clamp(num(0, int), 10, 5000))
                 print(f"[MB] glide time = {self.glide_ms}ms for the full span")
             elif cmd == "oor":
-                if args and args[0] in ("ignore", "retrigger", "clamp"):
+                if args and args[0] in ("reanchor", "ignore", "retrigger", "clamp"):
                     self.out_of_range = args[0]
                     print(f"[MB] out-of-range = {self.out_of_range}")
                 else:
-                    print("usage: oor <ignore|retrigger|clamp>")
+                    print("usage: oor <reanchor|ignore|retrigger|clamp>")
             elif cmd == "vel":
                 self.velocity = int(clamp(num(0, int), 1, 127))
                 print(f"[MB] velocity = {self.velocity}")
