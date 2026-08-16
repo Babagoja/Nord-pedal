@@ -115,6 +115,8 @@ class Nord6:
         "pedal_targets": [],
     }
     PRESETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
+    # Seconds to confirm the erase-everything button with a second press.
+    CLEAR_CONFIRM_WINDOW = 5.0
 
     @staticmethod
     def _open_nord_ports():
@@ -168,10 +170,15 @@ class Nord6:
         self._leds = {}                  # populated by _setup_inputs_gpio; empty on Windows
 
         # ----------------------------
-        # PRESET POINTER & DATA
+        # PER-PATCH EFFECT SETTINGS
         # ----------------------------
-        self.preset_pointer = 3          # 1..5, middle on every startup
-        self._preset_data = {}           # slot_str -> captured dict (slots 2-5)
+        # Keyed "bank:program". Every program change applies the matching entry,
+        # or the defaults when there isn't one — deliberately mirroring the way
+        # the Nord itself resets its effects on a patch change, so there is one
+        # mental model rather than two.
+        self._patch_presets = {}         # "bank:program" -> captured dict
+        self._clear_armed_at = 0.0       # two-press confirm for the wipe
+        self._program_echo_until = 0.0   # ignore our own program change coming back
         self._preset_load_disk()
 
         # ----------------------------
@@ -375,12 +382,12 @@ class Nord6:
         # Windows dev/test bindings. Pi uses GPIO instead.
         import keyboard
 
-        # wasd: octave/program with shift-modified preset alternates
-        # (matches Pi buttons 4/5/6/7).
-        keyboard.on_press_key("w", lambda _: self._shift_alt(self.octave_up,    self._preset_save_pointed))
-        keyboard.on_press_key("a", lambda _: self._shift_alt(self.prev_program, lambda: self._preset_cycle(-1)))
-        keyboard.on_press_key("s", lambda _: self._shift_alt(self.octave_down,  self._preset_load_pointed))
-        keyboard.on_press_key("d", lambda _: self._shift_alt(self.next_program, lambda: self._preset_cycle(+1)))
+        # wasd: octave/program, matching Pi buttons 4/5/6/7. Shift+w erases all
+        # stored patch settings, shift+s saves the current patch.
+        keyboard.on_press_key("w", lambda _: self._shift_alt(self.octave_up,   self._patch_clear_all))
+        keyboard.on_press_key("a", lambda _: self._if_active(self.prev_program))
+        keyboard.on_press_key("s", lambda _: self._shift_alt(self.octave_down, self._patch_save_current))
+        keyboard.on_press_key("d", lambda _: self._if_active(self.next_program))
 
         keyboard.on_press_key("1", lambda _: self._if_active(lambda: self.toggle_engine("organ")))
         keyboard.on_press_key("2", lambda _: self._if_active(lambda: self.toggle_engine("piano")))
@@ -444,21 +451,23 @@ class Nord6:
             lambda: self.toggle_effect("fx1"))
         self._gpio_buttons.append(b3)
 
-        # Buttons 4-7: octave / program nav, with shift-modified preset ops.
+        # Buttons 4-7: octave / program nav. Shift on the two octave buttons
+        # saves this patch's effects, and erases every stored patch. Program
+        # nav has no shift alternate — loading is automatic on patch change.
         b4 = Button(PINS["octave_up"], pull_up=True, bounce_time=BOUNCE)
-        b4.when_pressed = lambda: self._shift_alt(self.octave_up, self._preset_save_pointed)
+        b4.when_pressed = lambda: self._shift_alt(self.octave_up, self._patch_clear_all)
         self._gpio_buttons.append(b4)
 
         b5 = Button(PINS["program_prev"], pull_up=True, bounce_time=BOUNCE)
-        b5.when_pressed = lambda: self._shift_alt(self.prev_program, lambda: self._preset_cycle(-1))
+        b5.when_pressed = lambda: self._if_active(self.prev_program)
         self._gpio_buttons.append(b5)
 
         b6 = Button(PINS["octave_down"], pull_up=True, bounce_time=BOUNCE)
-        b6.when_pressed = lambda: self._shift_alt(self.octave_down, self._preset_load_pointed)
+        b6.when_pressed = lambda: self._shift_alt(self.octave_down, self._patch_save_current)
         self._gpio_buttons.append(b6)
 
         b7 = Button(PINS["program_next"], pull_up=True, bounce_time=BOUNCE)
-        b7.when_pressed = lambda: self._shift_alt(self.next_program, lambda: self._preset_cycle(+1))
+        b7.when_pressed = lambda: self._if_active(self.next_program)
         self._gpio_buttons.append(b7)
 
         # Buttons 8/9: ctrl/shift modifiers. Always tracked, even when
@@ -525,6 +534,10 @@ class Nord6:
                 if msg.type == "program_change":
                     self.state["program"] = msg.program
                     print(f"⬅ SYNC -> Bank {self.state['bank']} | Program {self.state['program']}")
+                    # _send_program already applied settings for a change we
+                    # initiated; this is that message coming back to us.
+                    if time.time() >= self._program_echo_until:
+                        self._patch_apply_current()
                     continue
 
                 if msg.type == "control_change":
@@ -894,47 +907,93 @@ class Nord6:
     def _preset_load_disk(self):
         try:
             with open(self.PRESETS_PATH, "r", encoding="utf-8") as f:
-                self._preset_data = json.load(f)
+                raw = json.load(f)
         except FileNotFoundError:
-            self._preset_data = {}
+            raw = {}
         except Exception as e:
             print(f"[PRESET] failed to read {self.PRESETS_PATH}: {e}")
-            self._preset_data = {}
+            raw = {}
+
+        if isinstance(raw, dict) and "patches" in raw:
+            self._patch_presets = raw["patches"]
+            print(f"[PRESET] loaded settings for {len(self._patch_presets)} patch(es)")
+        else:
+            # A file from the old numbered-slot system. Slots are gone; start
+            # clean rather than guessing which patch a slot belonged to.
+            if raw:
+                print("[PRESET] ignoring old slot-based presets file")
+            self._patch_presets = {}
 
     def _preset_write_disk(self):
+        # Write to a temp file in the same directory, fsync, then os.replace —
+        # which is atomic. The Pi loses power abruptly at a latching switch, and
+        # a plain open(...,"w") truncates first, so a cut mid-write would leave
+        # an empty file and take every saved setting with it.
+        tmp = self.PRESETS_PATH + ".tmp"
         try:
-            with open(self.PRESETS_PATH, "w", encoding="utf-8") as f:
-                json.dump(self._preset_data, f, indent=2)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"version": 2, "patches": self._patch_presets}, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.PRESETS_PATH)
         except Exception as e:
             print(f"[PRESET] failed to write {self.PRESETS_PATH}: {e}")
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
     # ----------------------------
     # PRESETS — user-facing actions
     # ----------------------------
-    def _preset_cycle(self, direction):
-        new_ptr = max(1, min(5, self.preset_pointer + direction))
-        self.preset_pointer = new_ptr
-        print(f"[PRESET] pointer at slot {self.preset_pointer}")
+    def _patch_key(self):
+        return f"{self.state['bank']}:{self.state['program']}"
 
-    def _preset_load_pointed(self):
-        if self.preset_pointer == 1:
-            self._preset_apply(self.BASE_PRESET)
-            print("[PRESET] loaded base (slot 1)")
-            return
-        p = self._preset_data.get(str(self.preset_pointer))
+    def _patch_apply_current(self):
+        """Apply the current patch's saved effects, or the defaults.
+
+        Unsaved patches deliberately get the defaults — effects off — matching
+        how the Nord resets its own effects on a patch change. Forgetting to
+        save means redoing them; that is the accepted trade for consistency.
+        """
+        key = self._patch_key()
+        p = self._patch_presets.get(key)
         if p is None:
-            print(f"[PRESET] slot {self.preset_pointer} is empty — nothing loaded")
-            return
-        self._preset_apply(p)
-        print(f"[PRESET] loaded slot {self.preset_pointer}")
+            self._preset_apply(self.BASE_PRESET)
+            print(f"[PATCH] {key} — no saved settings, defaults applied")
+        else:
+            self._preset_apply(p)
+            print(f"[PATCH] {key} — settings applied")
 
-    def _preset_save_pointed(self):
-        if self.preset_pointer == 1:
-            print("[PRESET] slot 1 is read-only base, cannot overwrite")
-            return
-        self._preset_data[str(self.preset_pointer)] = self._preset_capture()
+    def _patch_save_current(self):
+        key = self._patch_key()
+        self._patch_presets[key] = self._preset_capture()
         self._preset_write_disk()
-        print(f"[PRESET] saved to slot {self.preset_pointer}")
+        print(f"[PATCH] {key} — settings saved ({len(self._patch_presets)} stored)")
+
+    def _patch_clear_all(self):
+        """Erase every stored patch setting. Two presses to confirm.
+
+        One stray press on a foot controller would otherwise wipe every song's
+        setup with no way back, so the first press only arms it, and the
+        previous file is kept as .bak even after the second.
+        """
+        now = time.time()
+        if now - self._clear_armed_at > self.CLEAR_CONFIRM_WINDOW:
+            self._clear_armed_at = now
+            print(f"[PATCH] press again within {self.CLEAR_CONFIRM_WINDOW:.0f}s "
+                  f"to ERASE all {len(self._patch_presets)} stored patch settings")
+            return
+
+        self._clear_armed_at = 0.0
+        try:
+            if os.path.exists(self.PRESETS_PATH):
+                os.replace(self.PRESETS_PATH, self.PRESETS_PATH + ".bak")
+        except Exception as e:
+            print(f"[PATCH] backup failed, clearing anyway: {e}")
+        self._patch_presets = {}
+        self._preset_write_disk()
+        print("[PATCH] all settings erased (previous file kept as presets.json.bak)")
 
     # ----------------------------
     # PAN ON/OFF
@@ -1865,6 +1924,12 @@ class Nord6:
             self.state["octave"] = 0  # display only; don't touch the patch
 
         print(f"▶ Bank {self.state['bank']} | Program {self.state['program']} | Octave {self.state['octave']}")
+
+        # Apply this patch's effects here rather than waiting for the Nord to
+        # echo the program change back, and suppress that echo so it does not
+        # apply twice.
+        self._program_echo_until = time.time() + 0.3
+        self._patch_apply_current()
 
     # ----------------------------
     # OCTAVE
