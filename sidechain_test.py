@@ -433,7 +433,8 @@ class SidechainBench:
   hit               fire one envelope manually
   floor <0-127>     duck floor (0 = silence on each hit, ceiling = no duck)
   ceiling <0-127>   value the duck returns to — never sends above this
-  raw <cc> <val>    send one raw CC on channel 16, for manual A/B
+  raw <cc> <v> [ch] send one raw CC (channel 1-16, default 16), for manual A/B
+  chscan [cc]       duck CC7 on each channel in turn — finds per-section channels
   len <sec>         recovery length (0.03 - 1.5)
   curve <1-4>       power-curve exponent; higher hangs lower for longer
   cc <7|11>         switch duck target (sends 127 to the old CC first)
@@ -477,15 +478,42 @@ class SidechainBench:
         elif cmd == "raw":
             try:
                 cc_num, val = int(args[0]), int(clamp(int(args[1]), 0, 127))
+                # Optional channel, given 1-16 as the Nord displays it.
+                ch = int(clamp(int(args[2]), 1, 16)) - 1 if len(args) > 2 else CHANNEL
                 if self.out is None:
                     print("[RAW] no output")
                 else:
                     self.out.send(mido.Message(
-                        "control_change", control=cc_num, value=val, channel=CHANNEL
+                        "control_change", control=cc_num, value=val, channel=ch
                     ))
-                    print(f"[RAW] CC{cc_num} = {val}")
+                    print(f"[RAW] CC{cc_num} = {val} on channel {ch + 1}")
             except (IndexError, ValueError):
-                print("usage: raw <cc> <0-127>")
+                print("usage: raw <cc> <0-127> [channel 1-16]")
+
+        elif cmd == "chscan":
+            # Which MIDI channel does each section listen on? Duck CC7 hard on
+            # one channel at a time and hear which part of the sound drops out.
+            if self.out is None or self.drone_note is None:
+                print("[CHSCAN] needs an output and a sounding drone "
+                      "(play a patch with more than one section active)")
+            else:
+                cc_num = int(args[0]) if args else 7
+                self._probing = True
+                try:
+                    for ch in range(16):
+                        print(f"       CC{cc_num} = 0 on channel {ch + 1}")
+                        self.out.send(mido.Message(
+                            "control_change", control=cc_num, value=0, channel=ch))
+                        time.sleep(1.5)
+                        self.out.send(mido.Message(
+                            "control_change", control=cc_num, value=self.sc_ceiling, channel=ch))
+                        time.sleep(0.4)
+                        if self.stop_event.is_set():
+                            return True
+                finally:
+                    self._probing = False
+                    self._sc_restore()
+                print("[CHSCAN] done. Note which channels silenced which section.")
 
         elif cmd == "drone":
             if not args:
