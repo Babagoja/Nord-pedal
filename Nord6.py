@@ -315,7 +315,10 @@ class Nord6:
         self.mb_sounding_note = None
         self.mb_pitch = 0
         self.mb_target = 0
+        self.mb_last_sent = None      # last pitchwheel emitted; None forces a send
         self.MB_MAX_BEND = 8191
+        # The Nord's own response to pitchwheel tops out at a whole tone, so
+        # anything wider has to be reached by re-triggering rather than bending.
         self.MB_SEMITONE_RANGE = 2
         self.MB_DT = 0.01
 
@@ -1039,6 +1042,12 @@ class Nord6:
             self.out.send(mido.Message(
                 "pitchwheel", channel=self.CHANNEL, pitch=0
             ))
+            self.mb_last_sent = 0
+        else:
+            # The LFO writes the same pitchwheel while monobend is off, so what
+            # we last sent tells us nothing about where the wheel now sits.
+            # None forces the first emission rather than trusting a stale value.
+            self.mb_last_sent = None
 
         print(f"[MONOBEND] {'ON' if state else 'OFF'}")
 
@@ -1137,7 +1146,8 @@ class Nord6:
         diff = note - self.mb_sounding_note
         if abs(diff) <= self.MB_SEMITONE_RANGE:
             self.mb_target = int((diff / self.MB_SEMITONE_RANGE) * self.MB_MAX_BEND)
-        # out of range: ignore (harmony stays on the original voice)
+        else:
+            self._mb_reanchor(note)
 
     def _mb_note_off(self, note):
         if note in self.mb_held_notes:
@@ -1159,17 +1169,53 @@ class Nord6:
         if abs(diff) <= self.MB_SEMITONE_RANGE:
             self.mb_target = int((diff / self.MB_SEMITONE_RANGE) * self.MB_MAX_BEND)
         else:
+            self._mb_reanchor(newest)
+
+    # ----------------------------
+    # MONOBEND REANCHOR
+    # ----------------------------
+    def _mb_reanchor(self, want):
+        """Move the voice to `want` without moving the pitchwheel.
+
+        The wheel is channel-wide, so recentring it drags every voice still
+        sounding — including the one we just released, which is still in its
+        release tail. That made a run like C-D-E pull the dying C voice back
+        down from D to C, heard as the original note retriggering.
+
+        Instead the wheel stays put and we trigger a note offset by whatever
+        bend is currently applied: wheel at +2 semitones and E wanted, so play
+        D. Nothing already sounding moves. The reachable window then follows
+        the music rather than staying anchored to the first note, so an
+        ascending run keeps climbing and the way back down is pure bending.
+        """
+        bend_semis = (self.mb_pitch / self.MB_MAX_BEND) * self.MB_SEMITONE_RANGE
+        base = int(round(want - bend_semis))
+        base = max(0, min(127, base))
+        residual = want - base
+        new_pitch = max(-self.MB_MAX_BEND, min(self.MB_MAX_BEND,
+                        residual / self.MB_SEMITONE_RANGE * self.MB_MAX_BEND))
+
+        if self.mb_sounding_note is not None:
             self._harm_release_voice(self.mb_sounding_note)
             self.out.send(mido.Message(
                 "note_off", note=self.mb_sounding_note, velocity=0, channel=self.CHANNEL
             ))
+
+        # Usually a no-op: with the wheel parked at full deflection the offset
+        # is a whole number of semitones and nothing has to move at all.
+        if int(new_pitch) != self.mb_last_sent:
             self.out.send(mido.Message(
-                "note_on", note=newest, velocity=100, channel=self.CHANNEL
+                "pitchwheel", channel=self.CHANNEL, pitch=int(new_pitch)
             ))
-            self.mb_sounding_note = newest
-            self.mb_target = 0
-            self.mb_pitch = 0
-            self._harm_attach_voice(newest)
+            self.mb_last_sent = int(new_pitch)
+
+        self.mb_pitch = float(new_pitch)
+        self.mb_target = int(new_pitch)
+        self.out.send(mido.Message(
+            "note_on", note=base, velocity=100, channel=self.CHANNEL
+        ))
+        self.mb_sounding_note = base
+        self._harm_attach_voice(base)
 
     # ----------------------------
     # MONOBEND PITCH LERP LOOP
@@ -1186,9 +1232,15 @@ class Nord6:
                     if self.mb_pitch < self.mb_target:
                         self.mb_pitch = self.mb_target
 
-                self.out.send(mido.Message(
-                    "pitchwheel", channel=self.CHANNEL, pitch=int(self.mb_pitch)
-                ))
+                # Emit only on change. This used to send unconditionally —
+                # 100 messages a second down a shared port even while the
+                # pitch sat still at its target.
+                value = int(self.mb_pitch)
+                if value != self.mb_last_sent:
+                    self.out.send(mido.Message(
+                        "pitchwheel", channel=self.CHANNEL, pitch=value
+                    ))
+                    self.mb_last_sent = value
 
             time.sleep(self.MB_DT)
 
