@@ -34,6 +34,11 @@ SC_FLOOR_DEFAULT = 38
 SC_LENGTH_DEFAULT = 0.35
 SC_CURVE_DEFAULT = 2.0
 
+# The value the envelope returns to, and the most we ever send. NOT assumed to
+# be 127: if the Nord rests below that, restoring to 127 would leave a quiet
+# patch louder than the player set it. `ref` measures the true resting value.
+SC_CEILING_DEFAULT = 127
+
 SC_LENGTH_MIN = 0.03
 SC_LENGTH_MAX = 1.5
 SC_CURVE_MIN = 1.0
@@ -124,8 +129,9 @@ class SidechainBench:
         self.sc_floor = SC_FLOOR_DEFAULT
         self.sc_length = SC_LENGTH_DEFAULT
         self.sc_curve = SC_CURVE_DEFAULT
-        self.sc_trigger_time = None      # None = idle, at full volume
-        self.sc_last_sent = 127
+        self.sc_ceiling = SC_CEILING_DEFAULT
+        self.sc_trigger_time = None      # None = idle, at the ceiling
+        self.sc_last_sent = SC_CEILING_DEFAULT
         self.sc_volume_cc = 7            # 7 = channel volume (default), 11 = expression
 
         # ----------------------------
@@ -141,11 +147,17 @@ class SidechainBench:
     # ENVELOPE
     # ----------------------------
     def _sc_value(self, elapsed):
-        """Instant drop to floor, then an accelerating power-curve climb to 127."""
+        """Instant drop to floor, then an accelerating power-curve climb to the ceiling.
+
+        Never returns above sc_ceiling, so the duck can only ever attenuate —
+        it cannot leave a patch louder than the player set it.
+        """
+        top = self.sc_ceiling
+        floor = min(self.sc_floor, top)
         if elapsed >= self.sc_length:
-            return 127
+            return top
         frac = elapsed / self.sc_length
-        return int(round(self.sc_floor + (127 - self.sc_floor) * (frac ** self.sc_curve)))
+        return int(round(floor + (top - floor) * (frac ** self.sc_curve)))
 
     def _sc_trigger(self):
         self.sc_trigger_time = time.time()
@@ -158,10 +170,10 @@ class SidechainBench:
         ))
 
     def _sc_restore(self):
-        """Volume back to full. Every exit path must land here."""
+        """Volume back to the ceiling. Every exit path must land here."""
         self.sc_trigger_time = None
-        self.sc_last_sent = 127
-        self._sc_send(127)
+        self.sc_last_sent = self.sc_ceiling
+        self._sc_send(self.sc_ceiling)
 
     # ----------------------------
     # OUTPUT LOOP (100 Hz)
@@ -171,7 +183,7 @@ class SidechainBench:
             if not self._probing:
                 t = self.sc_trigger_time
                 if t is None:
-                    value = 127
+                    value = self.sc_ceiling
                 else:
                     elapsed = time.time() - t
                     value = self._sc_value(elapsed)
@@ -294,7 +306,7 @@ class SidechainBench:
                     time.sleep(0.035)
 
                 self.out.send(mido.Message(
-                    "control_change", control=cc, value=127, channel=CHANNEL
+                    "control_change", control=cc, value=self.sc_ceiling, channel=CHANNEL
                 ))
                 reflected = self.cc_in_count.get(cc, 0) - before
                 if reflected:
@@ -305,18 +317,101 @@ class SidechainBench:
                 time.sleep(0.5)
         finally:
             self._probing = False
-            self.sc_last_sent = 127
-            self._sc_send(127)
+            self._sc_restore()
 
         print("\n[PROBE] done. Which one changed the volume? Set it with `cc 7` or `cc 11`.")
         print("        If NEITHER ducked, stop here — the approach needs rethinking.")
+
+    # ----------------------------
+    # REF — does our ceiling exceed the patch's own level?
+    # ----------------------------
+    def _ref(self, args):
+        """Compare the patch at rest against the patch with our ceiling applied.
+
+        The risk: if the Nord rests below 127 (the General MIDI default for
+        channel volume is 100, not 127), then restoring to 127 after each duck
+        makes a quiet patch louder than the player set it. Sending nothing is
+        the only way to hear the true resting level, and once we have sent any
+        value there is no way back except reloading the patch — hence the
+        two-step confirmation rather than a one-shot command.
+        """
+        if self.out is None:
+            print("[REF] no output — connect the Nord first")
+            return
+        if not args or args[0].lower() != "go":
+            print(
+                "\n[REF] Ceiling reference test.\n"
+                "  1. Pick a patch whose level is set WELL BELOW full (say 50%).\n"
+                "  2. Reload it on the Nord itself (press its program button) so\n"
+                f"     CC{self.sc_volume_cc} returns to its power-on default. We cannot reset it\n"
+                "     from here: Reset All Controllers does not touch channel volume.\n"
+                "  3. Start the drone, then type `ref go` and DO NOT touch the Nord.\n"
+                "\nYou will hear 4s of the patch untouched, then 4s with our ceiling\n"
+                "applied. If the second half is LOUDER, our ceiling is boosting the\n"
+                "patch and must come down.\n"
+            )
+            return
+        if self.drone_note is None:
+            print("[REF] nothing sounding. Run `drone B3` first.")
+            return
+
+        self._probing = True             # keep the envelope loop off the wire
+        try:
+            print(f"\n[REF] A — patch at rest, sending nothing on CC{self.sc_volume_cc}. Listen (4s).")
+            time.sleep(4.0)
+            print(f"[REF] B — sending CC{self.sc_volume_cc} = {self.sc_ceiling}. Listen (4s).")
+            self._sc_send(self.sc_ceiling)
+            self.sc_last_sent = self.sc_ceiling
+            time.sleep(4.0)
+        finally:
+            self._probing = False
+
+        print(
+            "\n[REF] Verdict:\n"
+            "  B louder than A  -> ceiling is too high. Run `find` to hunt the match.\n"
+            "  B same as A      -> ceiling is safe; the duck can only attenuate.\n"
+            "  B quieter than A -> ceiling is below rest; safe, but you are losing\n"
+            "                      headroom. Raise it until B matches A.\n"
+        )
+
+    def _find(self, args):
+        """Step the volume CC down from the ceiling so the resting value can be
+        matched by ear. Whatever value stops sounding louder than rest is the
+        real ceiling."""
+        if self.out is None:
+            print("[FIND] no output — connect the Nord first")
+            return
+        if self.drone_note is None:
+            print("[FIND] nothing sounding. Run `drone B3` first.")
+            return
+
+        try:
+            step = int(args[0]) if args else 8
+        except ValueError:
+            step = 8
+
+        self._probing = True
+        try:
+            print(f"\n[FIND] stepping CC{self.sc_volume_cc} down in {step}s, 2s each.")
+            print("       Note the value where it stops sounding louder than the patch at rest.")
+            for v in range(127, -1, -step):
+                print(f"       CC{self.sc_volume_cc} = {v}")
+                self._sc_send(v)
+                time.sleep(2.0)
+                if self.stop_event.is_set():
+                    return
+        finally:
+            self._probing = False
+            self._sc_restore()
+        print("[FIND] done. Set the match with `ceiling <value>`.")
 
     # ----------------------------
     # PLOT — envelope shape, no hardware needed
     # ----------------------------
     def _plot(self, rows=16, cols=56):
         vals = [self._sc_value(self.sc_length * (c / (cols - 1))) for c in range(cols)]
-        print(f"\nfloor={self.sc_floor}  length={round(self.sc_length, 3)}s  "
+        print(f"\nfloor={self.sc_floor}  ceiling={self.sc_ceiling}  "
+              f"length={round(self.sc_length, 3)}s  "
               f"curve={round(self.sc_curve, 2)}  cc={self.sc_volume_cc}")
         for r in range(rows):
             hi = 127 * (rows - r) / rows
@@ -332,9 +427,13 @@ class SidechainBench:
     # ----------------------------
     HELP = """
   probe             sweep CC11 then CC7 while a drone sounds — the critical test
+  ref [go]          does our ceiling exceed the patch's own level? read `ref` first
+  find [step]       step the volume CC down to find the patch's resting value
   drone <note|off>  hold/release a sustained note (e.g. drone B3)
   hit               fire one envelope manually
-  floor <0-127>     duck floor (0 = silence on each hit, 127 = no duck)
+  floor <0-127>     duck floor (0 = silence on each hit, ceiling = no duck)
+  ceiling <0-127>   value the duck returns to — never sends above this
+  raw <cc> <val>    send one raw CC on channel 16, for manual A/B
   len <sec>         recovery length (0.03 - 1.5)
   curve <1-4>       power-curve exponent; higher hangs lower for longer
   cc <7|11>         switch duck target (sends 127 to the old CC first)
@@ -358,6 +457,36 @@ class SidechainBench:
         elif cmd == "probe":
             self._probe()
 
+        elif cmd == "ref":
+            self._ref(args)
+
+        elif cmd == "find":
+            self._find(args)
+
+        elif cmd == "ceiling":
+            try:
+                self.sc_ceiling = int(clamp(int(args[0]), 0, 127))
+                if self.sc_floor > self.sc_ceiling:
+                    self.sc_floor = self.sc_ceiling
+                    print(f"[SC] floor lowered to {self.sc_floor} to stay under the ceiling")
+                self._sc_restore()
+                print(f"[SC] ceiling = {self.sc_ceiling}")
+            except (IndexError, ValueError):
+                print("usage: ceiling <0-127>")
+
+        elif cmd == "raw":
+            try:
+                cc_num, val = int(args[0]), int(clamp(int(args[1]), 0, 127))
+                if self.out is None:
+                    print("[RAW] no output")
+                else:
+                    self.out.send(mido.Message(
+                        "control_change", control=cc_num, value=val, channel=CHANNEL
+                    ))
+                    print(f"[RAW] CC{cc_num} = {val}")
+            except (IndexError, ValueError):
+                print("usage: raw <cc> <0-127>")
+
         elif cmd == "drone":
             if not args:
                 print("usage: drone <note|off>")
@@ -377,7 +506,7 @@ class SidechainBench:
 
         elif cmd == "floor":
             try:
-                self.sc_floor = int(clamp(int(args[0]), 0, 127))
+                self.sc_floor = int(clamp(int(args[0]), 0, self.sc_ceiling))
                 print(f"[SC] floor = {self.sc_floor}")
             except (IndexError, ValueError):
                 print("usage: floor <0-127>")
@@ -403,8 +532,7 @@ class SidechainBench:
                 # Restore the old CC before switching, so it can't be left ducked.
                 self._sc_restore()
                 self.sc_volume_cc = int(args[0])
-                self.sc_last_sent = 127
-                self._sc_send(127)
+                self._sc_restore()
                 print(f"[SC] duck target = CC{self.sc_volume_cc}")
 
         elif cmd == "plot":
@@ -426,7 +554,8 @@ class SidechainBench:
                     print("usage: auto <bpm|off>")
 
         elif cmd == "status":
-            print(f"floor={self.sc_floor}  length={round(self.sc_length, 3)}s  "
+            print(f"floor={self.sc_floor}  ceiling={self.sc_ceiling}  "
+                  f"length={round(self.sc_length, 3)}s  "
                   f"curve={round(self.sc_curve, 2)}  cc={self.sc_volume_cc}  "
                   f"drone={self.drone_note}  auto={self.auto_bpm}  mon={self.monitor}")
 
@@ -447,15 +576,17 @@ class SidechainBench:
         self.sc_trigger_time = None
         self._drone_off()
         if self.out is not None:
-            # Both CCs, not just the active one — a probe may have left the other down.
+            # Both CCs, not just the active one — a probe may have left the other
+            # down. Restore to the ceiling rather than 127: panic must never be
+            # the thing that leaves a quiet patch louder than the player set it.
             for cc in (7, 11):
                 self.out.send(mido.Message(
-                    "control_change", control=cc, value=127, channel=CHANNEL
+                    "control_change", control=cc, value=self.sc_ceiling, channel=CHANNEL
                 ))
             self.out.send(mido.Message(
                 "control_change", control=123, value=0, channel=CHANNEL
             ))
-        self.sc_last_sent = 127
+        self.sc_last_sent = self.sc_ceiling
 
     # ----------------------------
     # RUN
