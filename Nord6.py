@@ -67,6 +67,10 @@ class Nord6:
     # the threshold cannot chatter.
     SC_PEDAL_ON = 64
     SC_PEDAL_OFF = 32
+    # Temporary: logs every CC64 with its gap from the previous one, so the
+    # debounce window can be set from measured pedal behaviour rather than
+    # guessed. Set False once SC_TRIGGER_DEBOUNCE is settled.
+    SC_DEBUG_PEDAL = True
     # Knobs claimed only while shift is held — see _handle_cc. Unmodified, these
     # keep their existing jobs (102 pan, 103 mod amplitude, 107 mod frequency).
     SC_KNOB_FLOOR = 102
@@ -221,7 +225,8 @@ class Nord6:
         self.sc_trigger_time = None      # None = idle, sitting at the ceiling
         self.sc_last_sent = self.SC_CEILING_DEFAULT
         self.sc_last_trigger = 0.0       # for SC_TRIGGER_DEBOUNCE
-        self.sc_pedal_down = False       # edge state for the continuous pedal
+        self.sc_pedal_down = False       # edge state for the pedal
+        self._sc_last_pedal_msg = 0.0    # for SC_DEBUG_PEDAL gap timing
 
         # ----------------------------
         # EFFECT REGISTRY
@@ -548,6 +553,12 @@ class Nord6:
         # release does nothing. No note sustain, no arp chord-freeze — holding
         # the pedal down must not leave notes or a frozen chord stranded.
         if self.effects["CEFFECT_3"]:
+            if self.SC_DEBUG_PEDAL:
+                now = time.time()
+                gap = (now - self._sc_last_pedal_msg) * 1000 if self._sc_last_pedal_msg else 0.0
+                self._sc_last_pedal_msg = now
+                print(f"[PEDAL] CC64={value:3d} ch={channel} +{gap:6.0f}ms "
+                      f"down={self.sc_pedal_down}")
             if not self.sc_pedal_down and value >= self.SC_PEDAL_ON:
                 self.sc_pedal_down = True
                 self._sc_trigger(channel)
