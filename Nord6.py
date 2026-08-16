@@ -611,11 +611,13 @@ class Nord6:
             print(f"[HARMONIZER] interval = {semitones:+d} semitones")
             return
 
-        # Sidechain claims its three knobs ONLY while shift is held, so pan
-        # (102), mod amplitude (103) and mod frequency (107) keep working
-        # normally even with CEFFECT_3 on. Must run before _handle_arp_cc and
-        # before the CC103 mod-amplitude path below.
-        if self.shift_held and self.effects["CEFFECT_3"]:
+        # Sidechain claims its three knobs ONLY while the sustain pedal is held
+        # down, so pan (102), mod amplitude (103) and mod frequency (107) keep
+        # working normally even with CEFFECT_3 on. Holding the pedal costs one
+        # duck as it goes down and then sits still — edge detection means it
+        # does not keep firing — which makes it a usable modifier. Must run
+        # before _handle_arp_cc and before the CC103 mod-amplitude path below.
+        if self.sc_pedal_down and self.effects["CEFFECT_3"]:
             if cc == self.SC_KNOB_FLOOR:
                 with self.sc_lock:
                     self.sc_floor = min(value, self.sc_ceiling)
