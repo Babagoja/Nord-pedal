@@ -60,6 +60,13 @@ class Nord6:
     # close together is a duplicate, not a deliberate re-tap: 50ms is 1200bpm
     # sixteenths, far faster than a foot can move.
     SC_TRIGGER_DEBOUNCE = 0.05
+    # The sustain pedal is continuous, not a switch: it streams CC64 values as
+    # it travels. Firing on `value >= 64` re-triggers on every message above
+    # the threshold, so a slow press and a slow release both fire repeatedly.
+    # Trigger on the crossing instead, with hysteresis so a pedal resting near
+    # the threshold cannot chatter.
+    SC_PEDAL_ON = 64
+    SC_PEDAL_OFF = 32
     # Knobs claimed only while shift is held — see _handle_cc. Unmodified, these
     # keep their existing jobs (102 pan, 103 mod amplitude, 107 mod frequency).
     SC_KNOB_FLOOR = 102
@@ -214,6 +221,7 @@ class Nord6:
         self.sc_trigger_time = None      # None = idle, sitting at the ceiling
         self.sc_last_sent = self.SC_CEILING_DEFAULT
         self.sc_last_trigger = 0.0       # for SC_TRIGGER_DEBOUNCE
+        self.sc_pedal_down = False       # edge state for the continuous pedal
 
         # ----------------------------
         # EFFECT REGISTRY
@@ -540,8 +548,11 @@ class Nord6:
         # release does nothing. No note sustain, no arp chord-freeze — holding
         # the pedal down must not leave notes or a frozen chord stranded.
         if self.effects["CEFFECT_3"]:
-            if value >= 64:
+            if not self.sc_pedal_down and value >= self.SC_PEDAL_ON:
+                self.sc_pedal_down = True
                 self._sc_trigger(channel)
+            elif self.sc_pedal_down and value <= self.SC_PEDAL_OFF:
+                self.sc_pedal_down = False
             return
 
         self.sustain_on = value >= 64
@@ -1212,6 +1223,9 @@ class Nord6:
             time.sleep(self.SC_DT)
 
     def _set_sidechain(self, state):
+        # Either transition starts from a known pedal position: a stale "down"
+        # would swallow the next press, a stale "up" would fire a spurious duck.
+        self.sc_pedal_down = False
         if state:
             # Enabling mid-song: flush any sustain the pedal is already holding,
             # or those notes and the frozen arp chord are stranded — the pedal
@@ -1695,6 +1709,7 @@ class Nord6:
         self.harmonizer_active.clear()
         self.sustain_held_notes.clear()
         self.sustain_on = False
+        self.sc_pedal_down = False
         # Pausing mid-duck must not leave the instrument quiet.
         self._sc_restore()
         self.active = False
