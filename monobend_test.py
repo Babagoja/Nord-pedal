@@ -156,19 +156,43 @@ class MonobendBench:
             diff = newest - self.sounding
             if abs(diff) <= self.semitone_range:
                 self.target = self._target_for(newest)
+                return
+
+            if self.out_of_range == "retrigger":
+                self._retrigger(newest)
+                return
+            if self.out_of_range == "clamp":
+                self.target = MAX_BEND if diff > 0 else -MAX_BEND
+                return
+
+            # "ignore": a note ignored on the way in must stay ignored on the
+            # way out. Otherwise C-D-E with E out of range bends C up to D,
+            # silently drops E, and then retriggers on the E when D is
+            # released — honouring a note it had already refused.
+            in_range = [n for n in self.held
+                        if abs(n - self.sounding) <= self.semitone_range]
+            if in_range:
+                self.target = self._target_for(in_range[-1])
+            elif self.sounding in self.held:
+                self.target = 0
             else:
+                # The sounding note itself is gone and nothing reachable is
+                # left, so there is no voice to bend — take the newest.
                 self._retrigger(newest)
 
     def _retrigger(self, note):
         """Swap the sounding voice. Caller holds the lock."""
         if self.sounding is not None:
             self._note_off(self.sounding)
-        self._note_on(note)
-        self.sounding = note
-        self.target = 0
-        self.pitch = 0.0
+        # Centre the wheel BEFORE the new note speaks. Sending note_on first
+        # lets the new note sound at the outgoing bend until the next tick —
+        # up to 10ms of audibly wrong pitch on the attack.
         self._bend(0)
         self.last_sent = 0
+        self.pitch = 0.0
+        self.target = 0
+        self._note_on(note)
+        self.sounding = note
 
     # ----------------------------
     # PITCH LOOP
