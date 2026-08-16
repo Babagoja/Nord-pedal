@@ -96,7 +96,10 @@ class MonobendBench:
         # Step mode: the pitch we are gliding toward, as an absolute MIDI note.
         # Only step mode needs it; the other modes work straight off `target`.
         self.goal = None
-        self.step_velocity = 55      # re-articulation velocity when stepping
+        self.step_velocity = 55      # re-articulation velocity for the leap
+        # Where the leap lands: "target" straight on the goal, or "short" a
+        # range below it so the wheel bends the last stretch in.
+        self.leap_to = "target"
         self.monitor = False
         self.trace = True            # print the branch taken on every note event
         self.velocity = 100
@@ -138,9 +141,15 @@ class MonobendBench:
         re-articulates at the same pitch it had reached, with no jump at all.
         """
         heard = self._heard()
-        landing = self.goal - direction * self.semitone_range
-        landing = max(landing, heard) if direction > 0 else min(landing, heard)
-        note = int(clamp(round(landing), 0, 127))
+        if self.leap_to == "target":
+            # Land straight on the goal, wheel centred. The gesture is then a
+            # bend up to the wheel's limit followed by the target arriving
+            # cleanly — no second bend to give the leap away.
+            note = int(clamp(round(self.goal), 0, 127))
+        else:
+            landing = self.goal - direction * self.semitone_range
+            landing = max(landing, heard) if direction > 0 else min(landing, heard)
+            note = int(clamp(round(landing), 0, 127))
 
         self._note_off(self.sounding)
         self._bend(0)
@@ -150,10 +159,11 @@ class MonobendBench:
         self.sounding = note
         self.target = self._target_for(self.goal) if self.goal is not None else 0
         gap = note - heard
+        tail = ("" if self.target == 0
+                else f", then bend into {note_name(self.goal)}")
         self._t(f"   leap to {note_name(note)} "
-                + (f"({gap:+.1f} semitones skipped), " if abs(gap) > 0.05
-                   else "(same pitch, no jump), ")
-                + f"then bend into {note_name(self.goal)}")
+                + (f"({gap:+.1f} semitones skipped)" if abs(gap) > 0.05
+                   else "(same pitch, no jump)") + tail)
         return True
 
     def _note_off(self, note):
@@ -339,6 +349,23 @@ class MonobendBench:
                     self.target = 0
                     self.silent_since = None
                     self._t("(silence) wheel recentred")
+
+                # Leap check runs BEFORE this tick's glide, so the tick that
+                # first reaches the limit gets its value emitted normally. Doing
+                # it afterwards meant the `continue` skipped that send and the
+                # wheel never actually reached full deflection before leaping.
+                if (self.out_of_range == "jump" and self.sounding is not None
+                        and self.goal is not None):
+                    heard = self._heard()
+                    leapt = False
+                    if self.goal > heard + 0.01 and self.pitch >= MAX_BEND - 1:
+                        leapt = self._leap(1)
+                    elif self.goal < heard - 0.01 and self.pitch <= -MAX_BEND + 1:
+                        leapt = self._leap(-1)
+                    if leapt:
+                        time.sleep(MB_DT)
+                        continue
+
                 target = self.target
                 if self.glide == "linear":
                     step = self.bend_speed
@@ -359,23 +386,6 @@ class MonobendBench:
                     self.pitch = min(self.pitch + step, target)
                 elif self.pitch > target:
                     self.pitch = max(self.pitch - step, target)
-
-                # Step mode: pinned at the wheel's limit with further to go, so
-                # hand the remaining travel to the base note and carry on.
-                if (self.out_of_range == "jump" and self.sounding is not None
-                        and self.goal is not None):
-                    heard = self._heard()
-                    # Pinned at the limit in the direction of travel. Once the
-                    # leap lands, the goal is within a range of the new base, so
-                    # this cannot fire a second time.
-                    leapt = False
-                    if self.goal > heard + 0.01 and self.pitch >= MAX_BEND - 1:
-                        leapt = self._leap(1)
-                    elif self.goal < heard - 0.01 and self.pitch <= -MAX_BEND + 1:
-                        leapt = self._leap(-1)
-                    if leapt:
-                        time.sleep(MB_DT)
-                        continue
 
                 value = int(self.pitch)
                 # Also emit while nothing sounds, so the delayed recentre lands.
@@ -477,6 +487,8 @@ class MonobendBench:
   ms <n>             time: milliseconds to cover the full bend span
   recentre <sec>     silence before the wheel resets to centre (0 = never)
   stepvel <1-127>    re-articulation velocity for the leap (lower = softer)
+  leapto <mode>      target = land on the goal, no second bend
+                     short  = land a range below it and bend the rest in
   sweep [note]       hold a note and sweep the wheel, to measure the real range
   oor <mode>         out-of-range note:
                        reanchor  play it without moving the wheel (default)
@@ -528,6 +540,12 @@ class MonobendBench:
             elif cmd == "stepvel":
                 self.step_velocity = int(clamp(num(0, int), 1, 127))
                 print(f"[MB] step velocity = {self.step_velocity}")
+            elif cmd == "leapto":
+                if args and args[0] in ("target", "short"):
+                    self.leap_to = args[0]
+                    print(f"[MB] leap lands on the {self.leap_to}")
+                else:
+                    print("usage: leapto <target|short>")
             elif cmd == "sweep":
                 self._sweep(int(num(0, int)) if args else 60)
             elif cmd == "recentre":
@@ -553,7 +571,7 @@ class MonobendBench:
                 print(f"range=+/-{self.semitone_range}  glide={self.glide}  "
                       f"speed={self.bend_speed}  ease={self.ease_factor}  "
                       f"ms={self.glide_ms}  oor={self.out_of_range}  "
-                      f"recentre={self.recentre_delay}s  "
+                      f"recentre={self.recentre_delay}s  leapto={self.leap_to}  "
                       f"vel={self.velocity}\n"
                       f"held={[note_name(n) for n in self.held]}  "
                       f"sounding={note_name(self.sounding) if self.sounding is not None else None}  "
