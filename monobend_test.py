@@ -123,35 +123,37 @@ class MonobendBench:
             return None
         return self.sounding + (self.pitch / MAX_BEND) * self.semitone_range
 
-    def _step(self, direction):
-        """Shift the base a whole range and drop the wheel, in one move.
+    def _leap(self, direction):
+        """One re-articulation, with the wheel doing the work at both ends.
 
-        base + range with the wheel centred is the same pitch as base with the
-        wheel at full deflection, so the two cancel and the glide continues
-        without a jump. That buys unlimited travel from a wheel that only
-        reaches a whole tone. The cost is a re-articulation — softened by
-        step_velocity — which also masks the wheel snapping back.
+        Chaining steps every few semitones made the staircase obvious. Instead
+        bend to the wheel's limit, jump once to a note a range short of the
+        goal, and bend the rest of the way in. C to G becomes: bend C up to D,
+        land on F, bend F up to G. The middle is skipped outright, but the
+        movement at each end reads as a bend, and there is exactly one
+        re-articulation however far the interval is.
+
+        The landing never falls behind where we already are, so a small
+        overshoot collapses onto the current pitch — a 3-semitone bend
+        re-articulates at the same pitch it had reached, with no jump at all.
         """
-        span = 2 * self.semitone_range
-        new_base = clamp(self.sounding + direction * span, 0, 127)
-        if new_base == self.sounding:
-            return False
-        # Land the wheel at the FAR extreme, not centre. base+range and
-        # (base+2*range)-range are the same pitch, so nothing moves — but the
-        # wheel then has its whole travel ahead of it instead of half, which
-        # halves the re-articulations. Those are the only audible cost of
-        # stepping, so an octave costs three of them rather than six.
-        new_pitch = -direction * MAX_BEND
+        heard = self._heard()
+        landing = self.goal - direction * self.semitone_range
+        landing = max(landing, heard) if direction > 0 else min(landing, heard)
+        note = int(clamp(round(landing), 0, 127))
+
         self._note_off(self.sounding)
-        self._bend(new_pitch)
-        self.last_sent = int(new_pitch)
-        self.pitch = float(new_pitch)
-        self._note_on(new_base, self.step_velocity)
-        self.sounding = new_base
+        self._bend(0)
+        self.last_sent = 0
+        self.pitch = 0.0
+        self._note_on(note, self.step_velocity)
+        self.sounding = note
         self.target = self._target_for(self.goal) if self.goal is not None else 0
-        self._t(f"   step {'up' if direction > 0 else 'down'}: base "
-                f"{note_name(new_base)}, wheel to the far end, "
-                f"{span} semitones of travel now available")
+        gap = note - heard
+        self._t(f"   leap to {note_name(note)} "
+                + (f"({gap:+.1f} semitones skipped), " if abs(gap) > 0.05
+                   else "(same pitch, no jump), ")
+                + f"then bend into {note_name(self.goal)}")
         return True
 
     def _note_off(self, note):
@@ -196,10 +198,10 @@ class MonobendBench:
                 self.target = self._target_for(note)
                 self._t(f"press {note_name(note)}: {diff:+d} semis from "
                         f"{note_name(self.sounding)} -> BEND (target {self.target})")
-            elif self.out_of_range == "step":
+            elif self.out_of_range == "jump":
                 self.target = MAX_BEND if diff > 0 else -MAX_BEND
-                self._t(f"press {note_name(note)}: {diff:+d} semis -> GLIDE, "
-                        f"stepping the base as the wheel runs out")
+                self._t(f"press {note_name(note)}: {diff:+d} semis -> bend to the "
+                        f"limit, then one leap and bend in")
             elif self.out_of_range == "reanchor":
                 self._t(f"press {note_name(note)}: {diff:+d} semis, out of range "
                         f"-> REANCHOR")
@@ -241,10 +243,10 @@ class MonobendBench:
                         f"{note_name(newest)} -> BEND (target {self.target})")
                 return
 
-            if self.out_of_range == "step":
+            if self.out_of_range == "jump":
                 self.target = MAX_BEND if diff > 0 else -MAX_BEND
-                self._t(f"release {note_name(note)}: gliding to "
-                        f"{note_name(newest)}, stepping as needed")
+                self._t(f"release {note_name(note)}: bending toward "
+                        f"{note_name(newest)}, one leap if needed")
                 return
 
             if self.out_of_range == "reanchor":
@@ -360,18 +362,18 @@ class MonobendBench:
 
                 # Step mode: pinned at the wheel's limit with further to go, so
                 # hand the remaining travel to the base note and carry on.
-                if (self.out_of_range == "step" and self.sounding is not None
+                if (self.out_of_range == "jump" and self.sounding is not None
                         and self.goal is not None):
                     heard = self._heard()
-                    # Pinned at the limit *in the direction of travel*. Testing
-                    # abs(pitch) instead would re-fire immediately, since a step
-                    # deliberately lands at the opposite extreme.
-                    stepped = False
+                    # Pinned at the limit in the direction of travel. Once the
+                    # leap lands, the goal is within a range of the new base, so
+                    # this cannot fire a second time.
+                    leapt = False
                     if self.goal > heard + 0.01 and self.pitch >= MAX_BEND - 1:
-                        stepped = self._step(1)
+                        leapt = self._leap(1)
                     elif self.goal < heard - 0.01 and self.pitch <= -MAX_BEND + 1:
-                        stepped = self._step(-1)
-                    if stepped:
+                        leapt = self._leap(-1)
+                    if leapt:
                         time.sleep(MB_DT)
                         continue
 
@@ -474,12 +476,12 @@ class MonobendBench:
   ease <0.01-1.0>    ease: fraction of the remaining distance per tick
   ms <n>             time: milliseconds to cover the full bend span
   recentre <sec>     silence before the wheel resets to centre (0 = never)
-  stepvel <1-127>    re-articulation velocity when stepping (lower = softer)
+  stepvel <1-127>    re-articulation velocity for the leap (lower = softer)
   sweep [note]       hold a note and sweep the wheel, to measure the real range
   oor <mode>         out-of-range note:
                        reanchor  play it without moving the wheel (default)
-                       step      glide all the way, moving the base note when
-                                 the wheel runs out — unlimited bend range
+                       jump      bend to the limit, leap once, bend into the
+                                 target — one re-articulation at any distance
                        retrigger play it and recentre the wheel
                        ignore    drop it (Nord6.py's behaviour today)
                        clamp     bend as far as the range allows
@@ -533,11 +535,11 @@ class MonobendBench:
                 print(f"[MB] recentre after {self.recentre_delay}s of silence"
                       if self.recentre_delay else "[MB] wheel never auto-recentres")
             elif cmd == "oor":
-                if args and args[0] in ("reanchor", "step", "ignore", "retrigger", "clamp"):
+                if args and args[0] in ("reanchor", "jump", "ignore", "retrigger", "clamp"):
                     self.out_of_range = args[0]
                     print(f"[MB] out-of-range = {self.out_of_range}")
                 else:
-                    print("usage: oor <reanchor|step|ignore|retrigger|clamp>")
+                    print("usage: oor <reanchor|jump|ignore|retrigger|clamp>")
             elif cmd == "vel":
                 self.velocity = int(clamp(num(0, int), 1, 127))
                 print(f"[MB] velocity = {self.velocity}")
