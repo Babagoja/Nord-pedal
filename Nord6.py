@@ -55,6 +55,11 @@ class Nord6:
     # General MIDI default for channel volume is 100, and restoring above the
     # resting value would leave a quiet patch louder than the player set it.
     SC_CEILING_DEFAULT = 127
+    # One pedal press can arrive as several CC64 messages — the Nord transmits
+    # per active section, and _midi_loop acts on every channel. Anything this
+    # close together is a duplicate, not a deliberate re-tap: 50ms is 1200bpm
+    # sixteenths, far faster than a foot can move.
+    SC_TRIGGER_DEBOUNCE = 0.05
     # Knobs claimed only while shift is held — see _handle_cc. Unmodified, these
     # keep their existing jobs (102 pan, 103 mod amplitude, 107 mod frequency).
     SC_KNOB_FLOOR = 102
@@ -208,6 +213,7 @@ class Nord6:
         self.sc_ceiling = self.SC_CEILING_DEFAULT
         self.sc_trigger_time = None      # None = idle, sitting at the ceiling
         self.sc_last_sent = self.SC_CEILING_DEFAULT
+        self.sc_last_trigger = 0.0       # for SC_TRIGGER_DEBOUNCE
 
         # ----------------------------
         # EFFECT REGISTRY
@@ -498,7 +504,7 @@ class Nord6:
 
                 if msg.type == "control_change":
                     if msg.control == self.SUSTAIN_CC:
-                        self._handle_sustain(msg.value)
+                        self._handle_sustain(msg.value, getattr(msg, "channel", None))
                     elif msg.control == self.EXPRESSION_CC:
                         self._handle_expression(msg.value)
                     else:
@@ -529,13 +535,13 @@ class Nord6:
     # ----------------------------
     # SUSTAIN PEDAL
     # ----------------------------
-    def _handle_sustain(self, value):
+    def _handle_sustain(self, value, channel=None):
         # Sidechain claims the pedal outright: a press fires one duck, and the
         # release does nothing. No note sustain, no arp chord-freeze — holding
         # the pedal down must not leave notes or a frozen chord stranded.
         if self.effects["CEFFECT_3"]:
             if value >= 64:
-                self._sc_trigger()
+                self._sc_trigger(channel)
             return
 
         self.sustain_on = value >= 64
@@ -1146,9 +1152,14 @@ class Nord6:
         except Exception as e:
             print(f"[SIDECHAIN] send failed: {e}")
 
-    def _sc_trigger(self):
+    def _sc_trigger(self, channel=None):
+        now = time.time()
         with self.sc_lock:
-            self.sc_trigger_time = time.time()
+            if now - self.sc_last_trigger < self.SC_TRIGGER_DEBOUNCE:
+                print(f"[SIDECHAIN] duplicate pedal message ignored (channel {channel})")
+                return
+            self.sc_last_trigger = now
+            self.sc_trigger_time = now
             floor = min(self.sc_floor, self.sc_ceiling)
             send = floor != self.sc_last_sent
             if send:
