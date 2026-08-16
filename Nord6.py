@@ -67,10 +67,15 @@ class Nord6:
     # the threshold cannot chatter.
     SC_PEDAL_ON = 64
     SC_PEDAL_OFF = 32
-    # Temporary: logs every CC64 with its gap from the previous one, so the
-    # debounce window can be set from measured pedal behaviour rather than
-    # guessed. Set False once SC_TRIGGER_DEBOUNCE is settled.
-    SC_DEBUG_PEDAL = True
+    # The pedal's contact springs back closed ~10ms after release, for ~25ms,
+    # producing a phantom press. Measured on hardware: bounces land 8-11ms
+    # after a release, real re-taps 183ms or more. Ignore presses inside this
+    # window. Note this is release-to-press; SC_TRIGGER_DEBOUNCE is
+    # press-to-press and cannot see a bounce that follows a real release.
+    SC_PEDAL_REARM = 0.08
+    # Logs every CC64 with its gap from the previous one. Set True to re-measure
+    # pedal behaviour if bounce handling ever needs revisiting.
+    SC_DEBUG_PEDAL = False
     # Knobs claimed only while shift is held — see _handle_cc. Unmodified, these
     # keep their existing jobs (102 pan, 103 mod amplitude, 107 mod frequency).
     SC_KNOB_FLOOR = 102
@@ -227,6 +232,7 @@ class Nord6:
         self.sc_last_trigger = 0.0       # for SC_TRIGGER_DEBOUNCE
         self.sc_pedal_down = False       # edge state for the pedal
         self._sc_last_pedal_msg = 0.0    # for SC_DEBUG_PEDAL gap timing
+        self.sc_pedal_up_time = 0.0      # last release, for SC_PEDAL_REARM
 
         # ----------------------------
         # EFFECT REGISTRY
@@ -560,10 +566,18 @@ class Nord6:
                 print(f"[PEDAL] CC64={value:3d} ch={channel} +{gap:6.0f}ms "
                       f"down={self.sc_pedal_down}")
             if not self.sc_pedal_down and value >= self.SC_PEDAL_ON:
+                # Track the position either way, so holding the pedal still
+                # gates the knobs even when the duck itself is suppressed.
                 self.sc_pedal_down = True
-                self._sc_trigger(channel)
+                since_release = time.time() - self.sc_pedal_up_time
+                if since_release >= self.SC_PEDAL_REARM:
+                    self._sc_trigger(channel)
+                else:
+                    print(f"[SIDECHAIN] contact bounce ignored "
+                          f"({since_release * 1000:.0f}ms after release)")
             elif self.sc_pedal_down and value <= self.SC_PEDAL_OFF:
                 self.sc_pedal_down = False
+                self.sc_pedal_up_time = time.time()
             return
 
         self.sustain_on = value >= 64
