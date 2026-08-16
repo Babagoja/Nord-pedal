@@ -92,7 +92,12 @@ class MonobendBench:
         self.glide = "linear"        # linear | ease | time
         self.out_of_range = "ignore" # ignore | retrigger | clamp
         self.monitor = False
+        self.trace = True            # print the branch taken on every note event
         self.velocity = 100
+
+    def _t(self, msg):
+        if self.trace:
+            print(f"      {msg}")
 
     # ----------------------------
     # OUTPUT
@@ -129,16 +134,24 @@ class MonobendBench:
                 self.target = 0
                 self._bend(0)
                 self.last_sent = 0
+                self._t(f"press {note_name(note)}: nothing sounding -> play it")
                 return
 
             diff = note - self.sounding
             if abs(diff) <= self.semitone_range:
                 self.target = self._target_for(note)
+                self._t(f"press {note_name(note)}: {diff:+d} semis from "
+                        f"{note_name(self.sounding)} -> BEND (target {self.target})")
             elif self.out_of_range == "retrigger":
+                self._t(f"press {note_name(note)}: {diff:+d} semis, out of range "
+                        f"-> RETRIGGER as a new note")
                 self._retrigger(note)
             elif self.out_of_range == "clamp":
                 self.target = MAX_BEND if diff > 0 else -MAX_BEND
-            # "ignore": leave the sounding voice alone, matching Nord6.py today
+                self._t(f"press {note_name(note)}: out of range -> CLAMP to max bend")
+            else:
+                self._t(f"press {note_name(note)}: {diff:+d} semis, out of range "
+                        f"-> IGNORED (this is Nord6.py's behaviour today)")
 
     def _off(self, note):
         with self.lock:
@@ -148,6 +161,7 @@ class MonobendBench:
             if not self.held:
                 if self.sounding is not None:
                     self._note_off(self.sounding)
+                self._t(f"release {note_name(note)}: nothing held -> note off")
                 self.sounding = None
                 self.target = 0
                 return
@@ -156,13 +170,18 @@ class MonobendBench:
             diff = newest - self.sounding
             if abs(diff) <= self.semitone_range:
                 self.target = self._target_for(newest)
+                self._t(f"release {note_name(note)}: newest held is "
+                        f"{note_name(newest)} -> BEND (target {self.target})")
                 return
 
             if self.out_of_range == "retrigger":
+                self._t(f"release {note_name(note)}: newest held "
+                        f"{note_name(newest)} out of range -> RETRIGGER")
                 self._retrigger(newest)
                 return
             if self.out_of_range == "clamp":
                 self.target = MAX_BEND if diff > 0 else -MAX_BEND
+                self._t(f"release {note_name(note)}: out of range -> CLAMP")
                 return
 
             # "ignore": a note ignored on the way in must stay ignored on the
@@ -173,9 +192,14 @@ class MonobendBench:
                         if abs(n - self.sounding) <= self.semitone_range]
             if in_range:
                 self.target = self._target_for(in_range[-1])
+                self._t(f"release {note_name(note)}: {note_name(newest)} was already "
+                        f"ignored -> BEND to {note_name(in_range[-1])} instead")
             elif self.sounding in self.held:
                 self.target = 0
+                self._t(f"release {note_name(note)}: nothing reachable -> "
+                        f"bend back to {note_name(self.sounding)}")
             else:
+                self._t(f"release {note_name(note)}: sounding voice gone -> RETRIGGER")
                 # The sounding note itself is gone and nothing reachable is
                 # left, so there is no voice to bend — take the newest.
                 self._retrigger(newest)
@@ -285,6 +309,7 @@ class MonobendBench:
   oor <mode>         out-of-range note: ignore | retrigger | clamp
   vel <1-127>        velocity for triggered notes
   mon <on|off>       print incoming notes
+  trace <on|off>     print the decision taken on every note event (on by default)
   status             show everything
   panic              all notes off, pitchwheel centred
   quit               panic, then exit
@@ -334,6 +359,9 @@ class MonobendBench:
             elif cmd == "mon":
                 self.monitor = bool(args) and args[0].lower() == "on"
                 print(f"[MON] {'on' if self.monitor else 'off'}")
+            elif cmd == "trace":
+                self.trace = bool(args) and args[0].lower() == "on"
+                print(f"[TRACE] {'on' if self.trace else 'off'}")
             elif cmd == "status":
                 print(f"range=+/-{self.semitone_range}  glide={self.glide}  "
                       f"speed={self.bend_speed}  ease={self.ease_factor}  "
