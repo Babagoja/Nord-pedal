@@ -114,9 +114,95 @@ class Nord6:
         "arp_live_retrigger": False,
         "pedal_targets": [],
     }
+    # Default location, used when nothing better is available.
     PRESETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
+    PRESET_FILENAME = "nord6_presets.json"
+    # The Pi runs a read-only overlay filesystem, so anything written under /
+    # goes to RAM and dies at the next power cut — which is how this pedal is
+    # always switched off. The boot partition is a separate real mount and is
+    # not overlaid, so settings written there survive.
+    PRESET_DIR_CANDIDATES = ("/boot/firmware", "/boot")
     # Seconds to confirm the erase-everything button with a second press.
     CLEAR_CONFIRM_WINDOW = 5.0
+
+    # ----------------------------
+    # WHERE SETTINGS CAN ACTUALLY BE STORED
+    # ----------------------------
+    @staticmethod
+    def _mount_fstype(path):
+        """Filesystem type of the mount covering `path`, or None off Linux."""
+        try:
+            with open("/proc/mounts", "r") as f:
+                mounts = [ln.split() for ln in f]
+        except OSError:
+            return None
+        path = os.path.abspath(path)
+        best, best_type = "", None
+        for parts in mounts:
+            if len(parts) < 3:
+                continue
+            mp, fstype = parts[1], parts[2]
+            if (path == mp or path.startswith(mp.rstrip("/") + "/")) and len(mp) >= len(best):
+                best, best_type = mp, fstype
+        return best_type
+
+    @classmethod
+    def _is_persistent(cls, directory):
+        # overlay and tmpfs accept writes happily and discard them on reboot,
+        # so a plain write test cannot tell them from real storage.
+        return cls._mount_fstype(directory) not in ("overlay", "tmpfs", "ramfs")
+
+    @staticmethod
+    def _is_writable(directory):
+        probe = os.path.join(directory, ".nord6_write_test")
+        try:
+            with open(probe, "w") as f:
+                f.write("x")
+                f.flush()
+                os.fsync(f.fileno())
+            os.remove(probe)
+            return True
+        except OSError:
+            return False
+
+    def _resolve_presets_path(self):
+        override = os.environ.get("NORD6_PRESETS")
+        if override:
+            print(f"[PRESET] path from NORD6_PRESETS: {override}")
+            return override
+
+        for d in self.PRESET_DIR_CANDIDATES:
+            if os.path.isdir(d) and self._is_persistent(d) and self._is_writable(d):
+                path = os.path.join(d, self.PRESET_FILENAME)
+                print(f"[PRESET] settings on {d} ({self._mount_fstype(d)}) "
+                      f"— survives power cuts")
+                return path
+
+        default = self.PRESETS_PATH
+        if not self._is_persistent(os.path.dirname(default)):
+            print("[PRESET] WARNING: no persistent writable location found.")
+            print(f"[PRESET] WARNING: using {default} on an overlay filesystem "
+                  f"— saved settings will be LOST at the next power cut.")
+            print("[PRESET] WARNING: make /boot writable, or set NORD6_PRESETS "
+                  "to a path on real storage.")
+        return default
+
+    def _migrate_presets(self):
+        """Carry settings over from the old in-repo location, once."""
+        old = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
+        if (self.PRESETS_PATH == old or os.path.exists(self.PRESETS_PATH)
+                or not os.path.exists(old)):
+            return
+        try:
+            with open(old, "r", encoding="utf-8") as f:
+                data = f.read()
+            with open(self.PRESETS_PATH, "w", encoding="utf-8") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            print(f"[PRESET] migrated existing settings to {self.PRESETS_PATH}")
+        except Exception as e:
+            print(f"[PRESET] migration failed: {e}")
 
     @staticmethod
     def _open_nord_ports():
@@ -179,6 +265,8 @@ class Nord6:
         self._patch_presets = {}         # "bank:program" -> captured dict
         self._clear_armed_at = 0.0       # two-press confirm for the wipe
         self._program_echo_until = 0.0   # ignore our own program change coming back
+        self.PRESETS_PATH = self._resolve_presets_path()
+        self._migrate_presets()
         self._preset_load_disk()
 
         # ----------------------------
