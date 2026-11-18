@@ -13,6 +13,28 @@ from statistics import mean
 
 class Nord6:
     # ----------------------------
+    # NORD SECTION CCS
+    # ----------------------------
+    # The Nord's own section enable buttons. Class-level because the pedal
+    # routing table below is built from them.
+    ENGINE_CCS = {
+        "organ": 9,
+        "piano": 33,
+        "synth": 42,
+    }
+    # Each section's level, used to ride one section's volume from the control
+    # pedal. Sent on the panel channel (0), like the activation bounces — CC7
+    # on self.CHANNEL is a single level for everything we generate and cannot
+    # tell the sections apart, which is why these are needed at all.
+    # Numbers from the Electro 6 MIDI implementation chart. None = that
+    # section simply has no pedal volume control.
+    ENGINE_LEVEL_CCS = {
+        "volume_organ": 13,
+        "volume_piano": 34,
+        "volume_synth": 43,     # chart calls it Sample Synth Level
+    }
+
+    # ----------------------------
     # ARP CONSTANTS (CEFFECT_4)
     # ----------------------------
     ARP_BPM_MIN = 40.0
@@ -389,9 +411,31 @@ class Nord6:
             91:  "mod_frequency",
             118: "mod_amplitude",
             116: "bend_speed",
+            # Ctrl + a section's own enable button binds the pedal to that
+            # section's level. Every sounding note is one we send back on
+            # self.CHANNEL, so the Nord's control pedal has no authority over
+            # it — without these there is no way to ride the volume of the
+            # arp, harmonizer or monobend.
+            self.ENGINE_CCS["organ"]: "volume_organ",
+            self.ENGINE_CCS["piano"]: "volume_piano",
+            self.ENGINE_CCS["synth"]: "volume_synth",
         }
         # Multiple targets can ride the pedal at once. Ctrl+CC toggles membership.
         self.pedal_targets = set()
+
+        # Last expression value seen, so binding a target can jump straight to
+        # where the foot already is instead of waiting for the next sweep.
+        self.expression_value = None
+        # Reverse map, so an incoming level CC can be traced to its section.
+        self.level_cc_to_target = {
+            cc: t for t, cc in self.ENGINE_LEVEL_CCS.items() if cc is not None
+        }
+        # Where the player left each section's level knob. Unbinding hands the
+        # level back to this rather than guessing, defaulting to full.
+        self.engine_level_rest = {t: 127 for t in self.ENGINE_LEVEL_CCS}
+        # Last level we emitted per section; None forces a send.
+        self.engine_level_sent = {t: None for t in self.ENGINE_LEVEL_CCS}
+        self._level_warned = set()       # sections warned about a missing CC
 
         # Default for monobend pitch-lerp speed (overridable via expression pedal)
         self.bend_speed = 2000
@@ -435,12 +479,6 @@ class Nord6:
         self.fx_toggle_state = {}
 
         self.OCTAVE_CCS = [12, 35, 44]
-
-        self.ENGINE_CCS = {
-            "organ": 9,
-            "piano": 33,
-            "synth": 42,
-        }
 
         self.EFFECT_CCS = {
             "fx1": 82,
@@ -708,9 +746,51 @@ class Nord6:
         self._arp_set_sustain(self.sustain_on)
 
     # ----------------------------
+    # SECTION LEVEL (control pedal → one engine's volume)
+    # ----------------------------
+    def _level_send(self, target, value):
+        """Set one section's level on the Nord. True if a message went out."""
+        cc = self.ENGINE_LEVEL_CCS.get(target)
+        if cc is None:
+            # No CC configured for this section, so there is nothing to drive.
+            # Say so once rather than on every message of a pedal sweep.
+            if target not in self._level_warned:
+                self._level_warned.add(target)
+                print(f"[PEDAL→VOLUME] {target}: no level CC configured, ignoring")
+            return False
+        if self.engine_level_sent.get(target) == value:
+            return False
+        self.engine_level_sent[target] = value
+        try:
+            self.out.send(mido.Message(
+                "control_change", channel=0, control=cc, value=value
+            ))
+        except Exception as e:
+            print(f"[PEDAL→VOLUME] {target} send failed: {e}")
+            return False
+        return True
+
+    def _level_release(self, target):
+        """Hand a section's level back to where the player's knob left it.
+
+        Unbinding with the pedal at the heel would otherwise leave that section
+        silent with nothing on screen to explain it.
+        """
+        # Nothing emitted or observed for this section means its level is
+        # wherever the panel knob is. Sending our idea of "full" there would
+        # overwrite a level we were never driving.
+        if self.engine_level_sent.get(target) is None:
+            return
+        self._level_send(target, self.engine_level_rest.get(target, 127))
+
+    # ----------------------------
     # EXPRESSION PEDAL (routes to current pedal_target)
     # ----------------------------
     def _handle_expression(self, value):
+        # Remembered for every message, including the early return below, so
+        # binding a target later can start from the pedal's real position.
+        self.expression_value = value
+
         # Arp's pedal→bpm is its own flag, not in self.pedal_targets, so it
         # runs independently of the ctrl-bind mechanism.
         if self.arp_pedal_to_speed:
@@ -738,10 +818,33 @@ class Nord6:
             self.bend_speed = int(1000 + (value / 127) * (3000 - 1000))
             print(f"[PEDAL→BEND SPEED] {self.bend_speed}")
 
+        # Section levels last: they are the only targets that emit MIDI from
+        # here, and pedal→speed owns the pedal outright when it is on — the
+        # levels then freeze where they are rather than following a tempo
+        # sweep. Each bound section is driven independently; the sidechain's
+        # duck rides CC7 on self.CHANNEL, a different address, so the Nord
+        # compounds the two without either having to know about the other.
+        if not self.arp_pedal_to_speed:
+            for target in self.ENGINE_LEVEL_CCS:
+                if target in self.pedal_targets and self._level_send(target, value):
+                    print(f"[PEDAL→VOLUME] {target} = {value}")
+
     # ----------------------------
     # CC HANDLER (knobs + shift/ctrl-gated toggles)
     # ----------------------------
     def _handle_cc(self, cc, value):
+
+        # A section's level knob moved on the Nord. Remember where the player
+        # left it so unbinding the pedal can hand that level back, but only
+        # while we are not the ones driving it — otherwise our own pedal
+        # values, reflected back, would overwrite the resting position.
+        # First in the chain so a level CC is never eaten by another path.
+        level_target = self.level_cc_to_target.get(cc)
+        if level_target is not None:
+            if level_target not in self.pedal_targets:
+                self.engine_level_rest[level_target] = value
+                self.engine_level_sent[level_target] = value
+            return
 
         # Harmonizer hijacks the shared speed dial (CC104) when active —
         # must run before _handle_arp_cc, which would otherwise eat CC104.
@@ -807,8 +910,14 @@ class Nord6:
 
             return
 
+        # The piano (CC33) and synth (CC42) enable buttons are not activation
+        # CCs — shift+engine still switches engines on the Nord — but
+        # ctrl+engine binds the pedal, so they need the same inverse bounce
+        # and the same echo guard as the rest.
+        bounceable = cc in self.ACTIVATION_CCS or cc in self.cc_to_pedal_target
+
         # Skip our own bounce echoed back through the Nord
-        if cc in self.ACTIVATION_CCS:
+        if bounceable:
             if time.time() - self.last_bounce_time.get(cc, 0) < self.BOUNCE_COOLDOWN:
                 return
 
@@ -827,7 +936,7 @@ class Nord6:
             return
 
         # Ctrl-modified activation: bounce inverse, assign control pedal target.
-        if self.ctrl_held and cc in self.ACTIVATION_CCS:
+        if self.ctrl_held and bounceable:
             opposite = 0 if value == 127 else 127
             self.out.send(mido.Message(
                 "control_change", channel=0, control=cc, value=opposite
@@ -839,9 +948,19 @@ class Nord6:
                 if target in self.pedal_targets:
                     self.pedal_targets.discard(target)
                     print(f"[PEDAL] unbound from {target}  (active: {sorted(self.pedal_targets) or 'none'})")
+                    if target in self.ENGINE_LEVEL_CCS:
+                        self._level_release(target)
                 else:
                     self.pedal_targets.add(target)
                     print(f"[PEDAL] bound to {target}  (active: {sorted(self.pedal_targets)})")
+                    # Take the pedal's real position straight away, so the
+                    # level matches the foot instead of jumping on the next
+                    # sweep. Before the pedal has moved once there is nothing
+                    # to take, and the section keeps its current level.
+                    if (target in self.ENGINE_LEVEL_CCS
+                            and self.expression_value is not None
+                            and not self.arp_pedal_to_speed):
+                        self._level_send(target, self.expression_value)
             return
 
         # Unmodified activation CCs: ignore (matches prior behavior)
@@ -996,6 +1115,14 @@ class Nord6:
         if self.effects["CEFFECT_4"] and self.effects["CEFFECT_6"]:
             self._set_effect_state("CEFFECT_4", False)
             print("[PRESET] mutex enforced: arp disabled (preset had both on)")
+
+        # pedal_targets just moved wholesale, so any section the outgoing patch
+        # was riding has to be handed back — otherwise a patch change with the
+        # pedal at the heel leaves that section silent. Sections the new patch
+        # rides pick the pedal up on its next message.
+        for target in self.ENGINE_LEVEL_CCS:
+            if target not in self.pedal_targets:
+                self._level_release(target)
 
     # ----------------------------
     # PRESETS — disk I/O
@@ -1943,6 +2070,12 @@ class Nord6:
         # Force the pan loop to re-emit on next tick (the synth was set to
         # 64 by the panic; last_sent_pan is still the pre-pause value).
         self.last_sent_pan = None
+        # The pause handed every ridden section back to its resting level, so
+        # put the pedal's position back before the player touches anything.
+        if self.expression_value is not None and not self.arp_pedal_to_speed:
+            for target in self.ENGINE_LEVEL_CCS:
+                if target in self.pedal_targets:
+                    self._level_send(target, self.expression_value)
         if "power" in self._leds:
             self._leds["power"].on()
         print("[Nord6] ACTIVE")
@@ -1977,6 +2110,10 @@ class Nord6:
         self.sc_pedal_down = False
         # Pausing mid-duck must not leave the instrument quiet.
         self._sc_restore()
+        # Nor may it leave a ridden section quiet: paused we stop reading the
+        # pedal, so hand every section back to its resting level.
+        for target in self.ENGINE_LEVEL_CCS:
+            self._level_release(target)
         self.active = False
         if "power" in self._leds:
             self._leds["power"].off()
@@ -2014,6 +2151,12 @@ class Nord6:
                 self.out.send(msg)
             except Exception as e:
                 print(f"[Nord6] panic send failed ({msg}): {e}")
+
+        # Hand back any section the pedal was riding. Quitting with the pedal
+        # at the heel must not leave that section silent — the next power-up
+        # would come back mute with nothing to point at.
+        for target in self.ENGINE_LEVEL_CCS:
+            self._level_release(target)
 
         # Close GPIO buttons (no-op on non-Pi).
         for b in self._gpio_buttons:
