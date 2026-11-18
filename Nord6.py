@@ -135,6 +135,11 @@ class Nord6:
         "arp_pedal_full_range": False,
         "arp_live_retrigger": False,
         "pedal_targets": [],
+        # Written out in full rather than built from ENGINE_LEVEL_CCS: a
+        # comprehension in a class body cannot see the class namespace.
+        "engine_level_max": {"volume_organ": 127,
+                             "volume_piano": 127,
+                             "volume_synth": 127},
     }
     # Default location, used when nothing better is available.
     PRESETS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets.json")
@@ -430,9 +435,11 @@ class Nord6:
         self.level_cc_to_target = {
             cc: t for t, cc in self.ENGINE_LEVEL_CCS.items() if cc is not None
         }
-        # Where the player left each section's level knob. Unbinding hands the
-        # level back to this rather than guessing, defaulting to full.
-        self.engine_level_rest = {t: 127 for t in self.ENGINE_LEVEL_CCS}
+        # The loudest each section may get: what the pedal reaches at full
+        # travel, and what a section is handed back when the pedal lets go.
+        # Set by the player's own level knob, so riding the pedal never pushes
+        # a section past the volume its patch was built around.
+        self.engine_level_max = {t: 127 for t in self.ENGINE_LEVEL_CCS}
         # Last level we emitted per section; None forces a send.
         self.engine_level_sent = {t: None for t in self.ENGINE_LEVEL_CCS}
         self._level_warned = set()       # sections warned about a missing CC
@@ -768,20 +775,32 @@ class Nord6:
         except Exception as e:
             print(f"[PEDAL→VOLUME] {target} send failed: {e}")
             return False
+        # Same guard the activation bounces use: if the Nord echoes this back
+        # we must not read our own write as the player setting a new maximum.
+        self.last_bounce_time[cc] = time.time()
         return True
 
+    def _level_scaled(self, target, pedal):
+        """The pedal position as a level, with full travel reaching the max.
+
+        The pedal is a fraction of the section's maximum rather than an
+        absolute level, so riding it cannot push a section past the volume the
+        patch was built around.
+        """
+        return int(round(pedal / 127.0 * self.engine_level_max.get(target, 127)))
+
     def _level_release(self, target):
-        """Hand a section's level back to where the player's knob left it.
+        """Hand a section's level back to its maximum.
 
         Unbinding with the pedal at the heel would otherwise leave that section
         silent with nothing on screen to explain it.
         """
         # Nothing emitted or observed for this section means its level is
-        # wherever the panel knob is. Sending our idea of "full" there would
-        # overwrite a level we were never driving.
+        # wherever the panel knob is. Sending our idea of its maximum there
+        # would overwrite a level we were never driving.
         if self.engine_level_sent.get(target) is None:
             return
-        self._level_send(target, self.engine_level_rest.get(target, 127))
+        self._level_send(target, self.engine_level_max.get(target, 127))
 
     # ----------------------------
     # EXPRESSION PEDAL (routes to current pedal_target)
@@ -826,24 +845,38 @@ class Nord6:
         # compounds the two without either having to know about the other.
         if not self.arp_pedal_to_speed:
             for target in self.ENGINE_LEVEL_CCS:
-                if target in self.pedal_targets and self._level_send(target, value):
-                    print(f"[PEDAL→VOLUME] {target} = {value}")
+                if target not in self.pedal_targets:
+                    continue
+                level = self._level_scaled(target, value)
+                if self._level_send(target, level):
+                    print(f"[PEDAL→VOLUME] {target} = {level}")
 
     # ----------------------------
     # CC HANDLER (knobs + shift/ctrl-gated toggles)
     # ----------------------------
     def _handle_cc(self, cc, value):
 
-        # A section's level knob moved on the Nord. Remember where the player
-        # left it so unbinding the pedal can hand that level back, but only
-        # while we are not the ones driving it — otherwise our own pedal
-        # values, reflected back, would overwrite the resting position.
-        # First in the chain so a level CC is never eaten by another path.
+        # A section's level knob moved on the Nord: that sets the section's
+        # maximum — the level the pedal reaches at full travel. First in the
+        # chain so a level CC is never eaten by another path.
         level_target = self.level_cc_to_target.get(cc)
         if level_target is not None:
-            if level_target not in self.pedal_targets:
-                self.engine_level_rest[level_target] = value
+            # Our own write echoing back is not the player turning a knob.
+            # Matched on the value rather than on time alone: a blanket window
+            # would swallow the start of a knob turn that follows a pedal
+            # move, and an echo always carries back exactly what we sent.
+            if (value == self.engine_level_sent.get(level_target)
+                    and time.time() - self.last_bounce_time.get(cc, 0)
+                    < self.BOUNCE_COOLDOWN):
+                return
+            # While the pedal is riding a section, only a ctrl-held turn counts
+            # — otherwise an accidental nudge mid-performance would silently
+            # redefine the ceiling. Unbound, the knob is just the knob.
+            if self.ctrl_held or level_target not in self.pedal_targets:
+                self.engine_level_max[level_target] = value
+                # The Nord applied the knob locally, so this is its level now.
                 self.engine_level_sent[level_target] = value
+                print(f"[PEDAL→VOLUME] {level_target} max = {value}")
             return
 
         # Harmonizer hijacks the shared speed dial (CC104) when active —
@@ -960,7 +993,8 @@ class Nord6:
                     if (target in self.ENGINE_LEVEL_CCS
                             and self.expression_value is not None
                             and not self.arp_pedal_to_speed):
-                        self._level_send(target, self.expression_value)
+                        self._level_send(
+                            target, self._level_scaled(target, self.expression_value))
             return
 
         # Unmodified activation CCs: ignore (matches prior behavior)
@@ -1068,6 +1102,7 @@ class Nord6:
             "arp_pedal_full_range": self.arp_pedal_full_range,
             "arp_live_retrigger": self.arp_live_retrigger,
             "pedal_targets": sorted(self.pedal_targets),
+            "engine_level_max": dict(self.engine_level_max),
         }
 
     def _preset_apply(self, p):
@@ -1088,6 +1123,12 @@ class Nord6:
         self.arp_pedal_full_range = p["arp_pedal_full_range"]
         self.arp_live_retrigger = p["arp_live_retrigger"]
         self.pedal_targets = set(p["pedal_targets"])
+        # .get throughout: presets saved before per-section volume existed do
+        # not carry this, and a bare lookup would brick the slot.
+        saved_max = p.get("engine_level_max") or {}
+        self.engine_level_max = {
+            t: saved_max.get(t, 127) for t in self.ENGINE_LEVEL_CCS
+        }
 
         # Sidechain keys read via .get: presets saved before CEFFECT_3 existed
         # do not carry them, and a bare p["key"] would KeyError and brick the
@@ -2075,7 +2116,8 @@ class Nord6:
         if self.expression_value is not None and not self.arp_pedal_to_speed:
             for target in self.ENGINE_LEVEL_CCS:
                 if target in self.pedal_targets:
-                    self._level_send(target, self.expression_value)
+                    self._level_send(
+                        target, self._level_scaled(target, self.expression_value))
         if "power" in self._leds:
             self._leds["power"].on()
         print("[Nord6] ACTIVE")
