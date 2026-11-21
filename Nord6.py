@@ -292,6 +292,11 @@ class Nord6:
         self._patch_presets = {}         # "bank:program" -> captured dict
         self._clear_armed_at = 0.0       # two-press confirm for the wipe
         self._program_echo_until = 0.0   # ignore our own program change coming back
+        # True only while a patch change is being applied. Loading a patch
+        # resets the Nord's own pan, volume and section levels, so our cleanup
+        # writes are redundant there — and worse, they land after the load,
+        # override what the patch stored, and leave the Nord showing "E".
+        self._applying_patch = False
         self.PRESETS_PATH = self._resolve_presets_path()
         self._migrate_presets()
         self._preset_load_disk()
@@ -1157,13 +1162,19 @@ class Nord6:
             self._set_effect_state("CEFFECT_4", False)
             print("[PRESET] mutex enforced: arp disabled (preset had both on)")
 
-        # pedal_targets just moved wholesale, so any section the outgoing patch
-        # was riding has to be handed back — otherwise a patch change with the
-        # pedal at the heel leaves that section silent. Sections the new patch
-        # rides pick the pedal up on its next message.
+        # Loading a patch sets every section's level from the patch itself, so
+        # whatever we last sent is no longer what the Nord has — forget it, or
+        # the next release would write a stale level back over the patch and
+        # flag it edited. A section the pedal is riding is the exception: the
+        # pedal owns its level, so re-assert the foot's position rather than
+        # let the new patch come in at full volume.
         for target in self.ENGINE_LEVEL_CCS:
-            if target not in self.pedal_targets:
-                self._level_release(target)
+            self.engine_level_sent[target] = None
+            if (target in self.pedal_targets
+                    and self.expression_value is not None
+                    and not self.arp_pedal_to_speed):
+                self._level_send(
+                    target, self._level_scaled(target, self.expression_value))
 
     # ----------------------------
     # PRESETS — disk I/O
@@ -1222,12 +1233,19 @@ class Nord6:
         """
         key = self._patch_key()
         p = self._patch_presets.get(key)
-        if p is None:
-            self._preset_apply(self.BASE_PRESET)
-            print(f"[PATCH] {key} — no saved settings, defaults applied")
-        else:
-            self._preset_apply(p)
-            print(f"[PATCH] {key} — settings applied")
+        # Set around the whole apply, not inside it: the suppression has to
+        # cover the effect transitions it triggers, which is where the
+        # patch-parameter writes actually happen.
+        self._applying_patch = True
+        try:
+            if p is None:
+                self._preset_apply(self.BASE_PRESET)
+                print(f"[PATCH] {key} — no saved settings, defaults applied")
+            else:
+                self._preset_apply(p)
+                print(f"[PATCH] {key} — settings applied")
+        finally:
+            self._applying_patch = False
 
     def _patch_save_current(self):
         key = self._patch_key()
@@ -1264,9 +1282,13 @@ class Nord6:
     # ----------------------------
     def _set_pan(self, state):
         if not state:
-            self.out.send(mido.Message(
-                "control_change", control=10, value=64, channel=self.CHANNEL
-            ))
+            # Centring pan is cleanup for a mid-performance switch-off. On a
+            # patch change the Nord already loaded the patch's own pan, and
+            # writing CC10 over it is what flags the patch edited.
+            if not self._applying_patch:
+                self.out.send(mido.Message(
+                    "control_change", control=10, value=64, channel=self.CHANNEL
+                ))
             self.last_sent_pan = 64
         else:
             # Force the loop to re-emit the current knob value on next tick
@@ -1624,7 +1646,11 @@ class Nord6:
             self.sc_trigger_time = None
             self.sc_last_sent = self.sc_ceiling
             ceiling = self.sc_ceiling
-        self._sc_send(ceiling)
+        # CC7 is the patch's Volume. On a patch change the Nord has already
+        # restored it, so cancelling the duck needs no write — the cache above
+        # is enough to keep us in step.
+        if not self._applying_patch:
+            self._sc_send(ceiling)
 
     def _sidechain_loop(self):
         while not self.stop_event.is_set():
